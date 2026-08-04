@@ -15,8 +15,8 @@ env:
   OLW_CONFIG: Release
 
 jobs:
-  build:
-    name: Build Open Live Writer
+  build-legacy:
+    name: Build legacy C# Open Live Writer
     runs-on: windows-latest
 
     steps:
@@ -52,8 +52,8 @@ jobs:
           path: src/managed/bin/${{ env.OLW_CONFIG }}/i386/Writer/
           if-no-files-found: warn
 
-  build-debug:
-    name: Build Debug Configuration
+  build-legacy-debug:
+    name: Build legacy C# Debug Configuration
     runs-on: windows-latest
     
     steps:
@@ -100,16 +100,16 @@ jobs:
           components: rustfmt, clippy
 
       - name: Check formatting
-        run: cargo fmt --manifest-path rust/Cargo.toml -- --check
+        run: cargo fmt -- --check
 
       - name: Run tests
-        run: cargo test --manifest-path rust/Cargo.toml
+        run: cargo test
 
       - name: Run Clippy
-        run: cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build release editor
-        run: cargo build --manifest-path rust/Cargo.toml --release
+        run: cargo build --release
 
       - name: Upload release editor
         uses: actions/upload-artifact@v4

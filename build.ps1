@@ -1,5 +1,16 @@
-# Cause powershell to fail on errors rather than keep going
-$ErrorActionPreference = "Stop";
+param(
+    [switch]$Legacy
+)
+
+$ErrorActionPreference = "Stop"
+
+if (-not $Legacy)
+{
+    & cargo build --release --manifest-path "$PSScriptRoot\Cargo.toml"
+    exit $LASTEXITCODE
+}
+
+# Legacy C# build: run with -Legacy while the migration is in progress.
 
 # Supported Visual Studio versions: VS2017, VS2019, VS2022, VS2026
 # To override the C++ platform toolset, pass: /p:PlatformToolset=v142 (or v141, v143, v144)

@@ -58,23 +58,24 @@ this open source fork of Live Writer formed and ready to ship. In December 2015 
 to the .NET Foundation and this passionate group of volunteer engineers rapidly assembled the first open source
 version.
 
-### Building
-Open Live Writer can be built by running build.cmd found in this directory.   
-It can be opened in Visual Studio.  The solution is in src/managed/writer.sln -- if you see errors in Visual Studio run build.cmd from the command prompt and it should be resolved.
-The main program is src/managed/OpenLiveWriter/ApplicationMain.cs .
-To run from Visual Studio, set the startup project to OpenLiveWriter.
+### Building the Rust + GPUI editor
 
-### Rust + GPUI Markdown editor
+Rust is the new application entry point:
 
-The new cross-platform editor is being rebuilt independently in rust/ so the
-legacy .NET editor remains available as a visual and publishing reference:
+    cargo run
+    cargo build --release
 
-    cargo run --manifest-path rust/Cargo.toml
+The old .NET solution under `src/managed/` remains only as a migration
+reference until its editor, providers, drafts, and media workflows are gone.
 
 The Rust editor supports Markdown editing, preview, UTF-8 file open/save,
 undo/redo, images, tables, and copying Markdown for direct pasting into Notion.
 With the documented environment variables, it can also create a Notion page or
 submit a Typecho-compatible MetaWeblog request.
+
+The legacy .NET solution can still be opened in Visual Studio while migration
+is in progress. Its compatibility build remains available through
+`build.ps1 -Legacy`.
 
 ### .NET Foundation
 
