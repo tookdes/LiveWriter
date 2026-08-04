@@ -81,3 +81,38 @@ jobs:
             /verbosity:minimal `
             /p:Configuration=Debug `
             /p:PlatformToolset=v143
+
+  build-rust-editor:
+    name: Build Rust + GPUI editor (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path rust/Cargo.toml -- --check
+
+      - name: Run tests
+        run: cargo test --manifest-path rust/Cargo.toml
+
+      - name: Run Clippy
+        run: cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+
+      - name: Build release editor
+        run: cargo build --manifest-path rust/Cargo.toml --release
+
+      - name: Upload release editor
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-live-writer-rust-${{ matrix.os }}
+          path: rust/target/release/open-live-writer*

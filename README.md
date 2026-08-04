@@ -64,6 +64,18 @@ It can be opened in Visual Studio.  The solution is in src/managed/writer.sln --
 The main program is src/managed/OpenLiveWriter/ApplicationMain.cs .
 To run from Visual Studio, set the startup project to OpenLiveWriter.
 
+### Rust + GPUI Markdown editor
+
+The new cross-platform editor is being rebuilt independently in rust/ so the
+legacy .NET editor remains available as a visual and publishing reference:
+
+    cargo run --manifest-path rust/Cargo.toml
+
+The Rust editor supports Markdown editing, preview, UTF-8 file open/save,
+undo/redo, images, tables, and copying Markdown for direct pasting into Notion.
+With the documented environment variables, it can also create a Notion page or
+submit a Typecho-compatible MetaWeblog request.
+
 ### .NET Foundation
 
 The Open Live Writer project is supported by the [.NET Foundation](http://www.dotnetfoundation.org).

@@ -168,6 +168,9 @@ ClientBin/
 node_modules/
 bower_components/
 
+# Rust + GPUI editor build output
+rust/target/
+
 # RIA/Silverlight projects
 Generated_Code/
 
