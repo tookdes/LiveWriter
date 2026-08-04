@@ -1,82 +1,39 @@
 # Open Live Writer
-Open Live Writer makes it easy to write, preview, and post to your blog.
-For more information see http://www.OpenLiveWriter.com/.
 
-### Installation
-You can install the latest version of Open Live Writer alongside an [older version of Windows Live Writer](http://windows.microsoft.com/en-us/windows-live/essentials). Visit
-http://www.OpenLiveWriter.com to download and install the latest release.
+Open Live Writer is a cross-platform Markdown editor written in **Rust** with
+[GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui). The Rust
+binary is the only application entry point; the old managed and native
+implementations are no longer part of the tree.
 
-### macOS (alpha)
-Open Live Writer is coming to macOS! An early alpha build (Apple Silicon) is available from the
-[Releases page](https://github.com/OpenLiveWriter/OpenLiveWriter/releases/tag/v0.1.1). It's a preview:
-the core editor, publishing, drafts, and account management work, but it is unsigned (right-click → Open
-the first time) and not yet feature-complete. Feedback welcome via
-[GitHub issues](https://github.com/OpenLiveWriter/OpenLiveWriter/issues).
+## Build and run
 
-### Latest News
-The current version of Open Live Writer is our first open source version.
-For a [list of known issues see GitHub](https://github.com/OpenLiveWriter/OpenLiveWriter/issues) or take a
-look at the [roadmap](roadmap.md) to see what the current plans are.
+```sh
+cargo run
+cargo test
+cargo build --release
+```
 
-For the latest news and updates about Open Live Writer, you can follow us on Twitter 
-([@OpenLiveWriter](https://twitter.com/OpenLiveWriter)), by keeping an eye on the website
- http://www.OpenLiveWriter.com or by watching this repo and subscribing to notifications.
+PowerShell users can run `./build.ps1` for a release build.
 
-### Contributing
-Open Live Writer is an open source project and wouldn't exist without the passionate community of volunteer
-[contributors](https://github.com/OpenLiveWriter/OpenLiveWriter/graphs/contributors).
-If you would like to help out then please see the [Contributing](CONTRIBUTING.md) guide.
+## Features
 
-This project has adopted the code of conduct defined by the [Contributor Covenant](http://contributor-covenant.org/)
-to clarify expected behavior in our community.
-For more information see the [.NET Foundation Code of Conduct](http://www.dotnetfoundation.org/code-of-conduct).
+- Ribbon-style editor with Markdown editing, preview, undo/redo, and clipboard;
+- Chinese IME marked text, UTF-16 text ranges, and logical-pixel HiDPI layout;
+- UTF-8 Markdown open/save and local draft recovery;
+- Markdown preview for headings, lists, quotes, code, images, video, tables,
+  inline formatting, and dividers;
+- optional Notion page creation and Typecho MetaWeblog publishing;
+- OS application-data storage for drafts and publishing credentials.
 
-### License
-Open Live Writer proudly uses the [MIT License](license.txt).
+Publishing configuration is read from environment variables. See
+[`rust/README.md`](rust/README.md); credentials must never be committed.
 
-### History
-The product that became Live Writer was originally created by a small, super-talented team of engineers including 
-JJ Allaire, Joe Cheng, Charles Teague, and Spike Washburn. The team was acquired by Microsoft 
-in 2006 and organized with the Spaces team. Becky Pezely joined the team and over time, the team grew and shipped
-many popular releases of Windows Live Writer.
+## Contributing
 
-As Microsoft was planning for the version of Windows Live that would coincide with Windows 8 operating system
-release, the teams that built the Windows Live client apps for Windows were encouraged to focus on building a 
-smaller set of Windows 8 apps designed to work well with both traditional PC input mechanisms and touch. 
-With the rise of micro-blogging platforms and other forms of sharing, eventually this team decided to conclude
-their work on Windows Live Writer with Windows Live Writer 2012.
+Run `cargo fmt --all`, `cargo test`, and
+`cargo clippy --workspace --all-targets -- -D warnings` before opening a pull
+request. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-Even though there was no active development, Windows Live Writer continued to be a favorite tool of a passionate
-community of Windows PC users for authoring, editing, and publishing blog posts. Data from WordPress.com at the 
-time suggested that Windows Live Writer (even two years after active development ended) was the #1 app for authoring
-a blog post to WordPress.com from a Windows PC. 
+## License
 
-A few employees at Microsoft took an interest in reviving Live Writer as an open source project in their
-spare time.  By January 2015, a group of about a half-dozen engineers interested in spending some of their
-volunteer time to help release an updated version of Live Writer had found each other and began work on getting
-this open source fork of Live Writer formed and ready to ship. In December 2015 Microsoft donated the code
-to the .NET Foundation and this passionate group of volunteer engineers rapidly assembled the first open source
-version.
-
-### Building the Rust + GPUI editor
-
-Rust is the new application entry point:
-
-    cargo run
-    cargo build --release
-
-The old .NET solution under `src/managed/` remains only as a migration
-reference until its editor, providers, drafts, and media workflows are gone.
-
-The Rust editor supports Markdown editing, preview, UTF-8 file open/save,
-undo/redo, images, tables, and copying Markdown for direct pasting into Notion.
-With the documented environment variables, it can also create a Notion page or
-submit a Typecho-compatible MetaWeblog request.
-
-The legacy .NET solution can still be opened in Visual Studio while migration
-is in progress. Its compatibility build remains available through
-`build.ps1 -Legacy`.
-
-### .NET Foundation
-
-The Open Live Writer project is supported by the [.NET Foundation](http://www.dotnetfoundation.org).
+Open Live Writer is released under the [MIT License](license.txt).

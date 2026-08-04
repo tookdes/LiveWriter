@@ -1,1 +1,0 @@
-tlbimp.exe SHDocVw.dll /out:OpenLiveWriter.Interop.SHDocVw.dll /namespace:OpenLiveWriter.Interop.SHDocVw

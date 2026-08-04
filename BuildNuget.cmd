@@ -1,1 +1,0 @@
-%LocalAppData%\NuGet\NuGet.exe pack OpenLiveWriter.SDK.nuspec -OutputDirectory .\

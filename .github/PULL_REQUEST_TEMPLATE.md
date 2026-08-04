@@ -18,7 +18,6 @@
 
 ## Checklist
 
-- [ ] I have signed the [.NET Foundation CLA](https://cla.dotnetfoundation.org/OpenLiveWriter/OpenLiveWriter)
 - [ ] I have tested my changes locally
 - [ ] My changes do not introduce new warnings or errors
 - [ ] I have updated documentation if needed
@@ -26,4 +25,3 @@
 ## Additional Notes
 
 <!-- Any additional information, screenshots, or context that reviewers should know about. -->
-

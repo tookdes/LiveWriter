@@ -1,5 +1,6 @@
 mod markdown;
 mod publishing;
+mod storage;
 
 use std::{
     borrow::Cow,
@@ -58,7 +59,9 @@ actions!(
         CopyText,
         NewDocument,
         OpenDocument,
+        OpenDraft,
         SaveDocument,
+        SaveDraft,
         TogglePreview,
         BoldText,
         ItalicText,
@@ -820,6 +823,7 @@ struct MarkdownEditor {
 enum PendingOperation {
     New,
     Open,
+    OpenDraft,
 }
 
 impl MarkdownEditor {
@@ -1028,6 +1032,52 @@ impl MarkdownEditor {
         self.new_document(&NewDocument, window, cx);
     }
 
+    fn save_draft(&mut self, _: &SaveDraft, _window: &mut Window, cx: &mut Context<Self>) {
+        match storage::save_draft(&self.content(cx)) {
+            Ok(path) => self.status = format!("草稿已保存 · {}", display_path(&path)).into(),
+            Err(error) => self.status = format!("草稿保存失败：{error}").into(),
+        }
+        cx.notify();
+    }
+
+    fn save_draft_click(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.save_draft(&SaveDraft, window, cx);
+    }
+
+    fn open_draft(&mut self, _: &OpenDraft, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.confirm_discard(PendingOperation::OpenDraft, window, cx);
+            return;
+        }
+        self.open_draft_now(cx);
+    }
+
+    fn open_draft_now(&mut self, cx: &mut Context<Self>) {
+        match storage::load_draft() {
+            Ok(Some((path, content))) => {
+                self.replace_document(None, normalize_newlines(content), cx);
+                self.status = format!("已打开草稿 · {}", display_path(&path)).into();
+            }
+            Ok(None) => self.status = "暂无本地草稿".into(),
+            Err(error) => self.status = format!("草稿打开失败：{error}").into(),
+        }
+        cx.notify();
+    }
+
+    fn open_draft_click(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_draft(&OpenDraft, window, cx);
+    }
+
     fn confirm_discard(
         &mut self,
         operation: PendingOperation,
@@ -1048,6 +1098,7 @@ impl MarkdownEditor {
             let _ = editor.update(cx, |editor, cx| match operation {
                 PendingOperation::New => editor.new_document_now(cx),
                 PendingOperation::Open => editor.begin_open(cx),
+                PendingOperation::OpenDraft => editor.open_draft_now(cx),
             });
         })
         .detach();
@@ -1482,7 +1533,9 @@ impl Render for MarkdownEditor {
             .key_context("MarkdownEditor")
             .on_action(cx.listener(Self::new_document))
             .on_action(cx.listener(Self::open_document))
+            .on_action(cx.listener(Self::open_draft))
             .on_action(cx.listener(Self::save_document))
+            .on_action(cx.listener(Self::save_draft))
             .on_action(cx.listener(Self::toggle_preview))
             .on_action(cx.listener(Self::toggle_settings))
             .on_action(cx.listener(Self::bold_action))
@@ -1562,6 +1615,16 @@ impl Render for MarkdownEditor {
                         "icons/save.png",
                         "保存",
                         cx.listener(Self::save_document_click),
+                    ))
+                    .child(ribbon_button(
+                        "icons/open.png",
+                        "打开草稿",
+                        cx.listener(Self::open_draft_click),
+                    ))
+                    .child(ribbon_button(
+                        "icons/save.png",
+                        "保存草稿",
+                        cx.listener(Self::save_draft_click),
                     ))
                     .child(separator())
                     .child(ribbon_button(
@@ -2305,7 +2368,9 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("secondary-n", NewDocument, None),
             KeyBinding::new("secondary-o", OpenDocument, None),
+            KeyBinding::new("secondary-shift-o", OpenDraft, None),
             KeyBinding::new("secondary-s", SaveDocument, None),
+            KeyBinding::new("secondary-shift-s", SaveDraft, None),
             KeyBinding::new("secondary-b", BoldText, None),
             KeyBinding::new("secondary-i", ItalicText, None),
             KeyBinding::new("secondary-1", HeadingText, None),
