@@ -7,18 +7,21 @@ use std::{
     fs,
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use gpui::{
-    App, Application, AssetSource, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
-    GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, PathPromptOptions, Pixels, Point, PromptLevel, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, Window, WindowBounds, WindowOptions, actions,
-    div, fill, hsla, img, point, prelude::*, px, relative, rgb, size, white,
+    AnyElement, App, Application, AssetSource, Bounds, ClipboardItem, Context, CursorStyle, Entity,
+    EntityInputHandler, FocusHandle, Focusable, FontWeight, Image, ImageFormat, Img, KeyBinding,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
+    PromptLevel, SharedString, Window, WindowBounds, WindowOptions, actions, div, hsla, img,
+    linear_color_stop, linear_gradient, prelude::*, px, relative, rgb, size, white,
+};
+use gpui_component::{
+    RopeExt,
+    input::{Input, InputEvent, InputState},
 };
 use rust_embed::Embed;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::markdown::{Block, parse_blocks};
 use crate::publishing::{
@@ -32,31 +35,28 @@ const DEFAULT_MARKDOWN: &str = "# 欢迎回来，Open Live Writer\n\n这是一�
 const BLUE: u32 = 0x3b78b4;
 const DARK_BLUE: u32 = 0x2b5f95;
 const RIBBON_BLUE: u32 = 0xe6eff9;
+const RIBBON_SEPARATOR: u32 = 0xc8d5e2;
+const RIBBON_TAB_HEIGHT: Pixels = px(30.);
+const RIBBON_HEIGHT: Pixels = px(84.);
+const RIBBON_BUTTON_WIDTH: Pixels = px(56.);
+const RIBBON_BUTTON_HEIGHT: Pixels = px(56.);
 const WORKSPACE: u32 = 0xe9edf2;
 const BORDER: u32 = 0xc6ced8;
 const TEXT: u32 = 0x263746;
 const MUTED: u32 = 0x617285;
 const INLINE_CODE_MARKER: &str = "\x60";
 
+macro_rules! ribbon_controls {
+    ($first:expr $(, $rest:expr)* $(,)?) => {{
+        let controls = div().flex().items_center().child($first);
+        $(let controls = controls.child($rest);)*
+        controls
+    }};
+}
+
 actions!(
     open_live_writer,
     [
-        Backspace,
-        Delete,
-        Left,
-        Right,
-        Up,
-        Down,
-        SelectLeft,
-        SelectRight,
-        SelectUp,
-        SelectDown,
-        SelectAll,
-        Home,
-        End,
-        PasteText,
-        CutText,
-        CopyText,
         NewDocument,
         OpenDocument,
         OpenDraft,
@@ -100,702 +100,180 @@ impl AssetSource for Assets {
     }
 }
 
-#[derive(Clone)]
-struct EditorLayout {
-    lines: Vec<ShapedLine>,
-    starts: Vec<usize>,
-    bounds: Bounds<Pixels>,
-    line_height: Pixels,
-}
-
-#[derive(Clone)]
-struct EditSnapshot {
-    content: String,
-    selected_range: Range<usize>,
-    selection_reversed: bool,
-}
-
 struct MarkdownInput {
-    focus_handle: FocusHandle,
+    state: Entity<InputState>,
     pub content: SharedString,
-    masked: bool,
-    selected_range: Range<usize>,
-    selection_reversed: bool,
-    marked_range: Option<Range<usize>>,
-    last_layout: Option<EditorLayout>,
-    is_selecting: bool,
-    // ponytail: full-text snapshots keep the first slice simple; switch to edit deltas for very long documents.
-    undo_stack: Vec<EditSnapshot>,
-    redo_stack: Vec<EditSnapshot>,
+    multi_line: bool,
+    pending_content: Option<SharedString>,
+    pending_insert: Option<SharedString>,
+    suppress_history: bool,
+    undo_stack: Vec<SharedString>,
+    redo_stack: Vec<SharedString>,
+    _subscription: gpui::Subscription,
 }
 
 impl MarkdownInput {
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        content: String,
+        masked: bool,
+        multi_line: bool,
+    ) -> Self {
+        let content: SharedString = content.into();
+        let state = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).default_value(content.clone());
+            if multi_line {
+                state = state.multi_line().soft_wrap(false);
+            }
+            state.masked(masked)
+        });
+        let subscription = cx.subscribe(
+            &state,
+            |input: &mut MarkdownInput, state, event: &InputEvent, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                let next = state.read(cx).value();
+                if next == input.content {
+                    return;
+                }
+                if !input.suppress_history {
+                    input.undo_stack.push(input.content.clone());
+                    input.redo_stack.clear();
+                }
+                input.content = next;
+                cx.notify();
+            },
+        );
+        Self {
+            state: state.clone(),
+            content,
+            multi_line,
+            pending_content: None,
+            pending_insert: None,
+            suppress_history: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            _subscription: subscription,
+        }
+    }
+
     fn set_content(&mut self, content: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.content = content.into();
-        self.selected_range = 0..0;
-        self.selection_reversed = false;
-        self.marked_range = None;
-        self.last_layout = None;
-        self.is_selecting = false;
+        let content = content.into();
+        self.content = content.clone();
+        self.pending_content = Some(content);
+        self.pending_insert = None;
+        self.suppress_history = true;
         self.undo_stack.clear();
         self.redo_stack.clear();
         cx.notify();
     }
 
-    fn cursor_offset(&self) -> usize {
-        if self.selection_reversed {
-            self.selected_range.start
-        } else {
-            self.selected_range.end
-        }
-    }
-
-    fn replace_range(&mut self, range: Range<usize>, replacement: &str, cx: &mut Context<Self>) {
-        self.replace_range_with_history(range, replacement, true, cx);
-    }
-
-    fn replace_range_with_history(
-        &mut self,
-        range: Range<usize>,
-        replacement: &str,
-        record_undo: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if record_undo {
-            self.undo_stack.push(self.snapshot());
-            self.redo_stack.clear();
-        }
-        let mut content = self.content.to_string();
-        content.replace_range(range.clone(), replacement);
-        let cursor = range.start + replacement.len();
-        self.content = content.into();
-        self.selected_range = cursor..cursor;
-        self.selection_reversed = false;
-        self.marked_range = None;
-        self.last_layout = None;
+    fn restore_content(&mut self, content: SharedString, cx: &mut Context<Self>) {
+        self.content = content.clone();
+        self.pending_content = Some(content);
+        self.pending_insert = None;
+        self.suppress_history = true;
         cx.notify();
     }
 
-    fn snapshot(&self) -> EditSnapshot {
-        EditSnapshot {
-            content: self.content.to_string(),
-            selected_range: self.selected_range.clone(),
-            selection_reversed: self.selection_reversed,
+    fn queue_insert(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let text: SharedString = text.into();
+        let mut pending = self
+            .pending_insert
+            .take()
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        pending.push_str(text.as_ref());
+        self.pending_insert = Some(pending.into());
+        cx.notify();
+    }
+
+    fn sync_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(content) = self.pending_content.take() {
+            let state = self.state.clone();
+            state.update(cx, |state, cx| state.set_value(content, window, cx));
+            self.suppress_history = false;
+        }
+        if let Some(text) = self.pending_insert.take() {
+            let state = self.state.clone();
+            state.update(cx, |state, cx| state.insert(text, window, cx));
         }
     }
 
-    fn restore(&mut self, snapshot: EditSnapshot) {
-        self.content = snapshot.content.into();
-        self.selected_range = snapshot.selected_range;
-        self.selection_reversed = snapshot.selection_reversed;
-        self.marked_range = None;
-        self.last_layout = None;
+    fn wrap_selection(
+        &mut self,
+        prefix: &str,
+        suffix: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prefix = prefix.to_owned();
+        let suffix = suffix.to_owned();
+        let state = self.state.clone();
+        state.update(cx, |state, cx| {
+            let Some(selection) = state.selected_text_range(false, window, cx) else {
+                return;
+            };
+            let range = state.text().offset_utf16_to_offset(selection.range.start)
+                ..state.text().offset_utf16_to_offset(selection.range.end);
+            let selected = state.text().slice(range).to_string();
+            state.replace(format!("{}{}{}", prefix, selected, suffix), window, cx);
+        });
     }
 
-    fn undo(&mut self, _: &UndoText, _window: &mut Window, cx: &mut Context<Self>) {
+    fn prefix_current_line(&mut self, prefix: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let prefix = prefix.to_owned();
+        let state = self.state.clone();
+        state.update(cx, |state, cx| {
+            let position = state.text().offset_to_position(state.cursor());
+            let line_start = state.text().line_start_offset(position.line as usize);
+            let line_start = state.text().offset_to_position(line_start);
+            state.set_cursor_position(line_start, window, cx);
+            state.insert(prefix, window, cx);
+        });
+    }
+
+    fn undo(&mut self, cx: &mut Context<Self>) {
         let Some(previous) = self.undo_stack.pop() else {
             return;
         };
-        self.redo_stack.push(self.snapshot());
-        self.restore(previous);
-        cx.notify();
+        self.redo_stack.push(self.content.clone());
+        self.restore_content(previous, cx);
     }
 
-    fn redo(&mut self, _: &RedoText, _window: &mut Window, cx: &mut Context<Self>) {
+    fn redo(&mut self, cx: &mut Context<Self>) {
         let Some(next) = self.redo_stack.pop() else {
             return;
         };
-        self.undo_stack.push(self.snapshot());
-        self.restore(next);
-        cx.notify();
-    }
-
-    fn replace_selection(&mut self, replacement: &str, cx: &mut Context<Self>) {
-        self.replace_range(self.selected_range.clone(), replacement, cx);
-    }
-
-    fn selected_text(&self) -> String {
-        self.content[self.selected_range.clone()].to_owned()
-    }
-
-    fn wrap_selection(&mut self, prefix: &str, suffix: &str, cx: &mut Context<Self>) {
-        let selected = self.selected_text();
-        let replacement = format!("{prefix}{selected}{suffix}");
-        let start = self.selected_range.start;
-        self.replace_range(self.selected_range.clone(), &replacement, cx);
-        self.selected_range = start..start + replacement.len();
-        self.selection_reversed = false;
-        cx.notify();
-    }
-
-    fn prefix_current_line(&mut self, prefix: &str, cx: &mut Context<Self>) {
-        let (line_start, _) = self.line_range(self.cursor_offset());
-        self.replace_range(line_start..line_start, prefix, cx);
-    }
-
-    fn line_starts(&self) -> Vec<usize> {
-        line_starts(self.content.as_ref())
-    }
-
-    fn line_range(&self, offset: usize) -> (usize, usize) {
-        let starts = self.line_starts();
-        let line = line_for_offset(&starts, offset);
-        let start = starts[line];
-        let end = line_end(&starts, line, self.content.len());
-        (start, end.max(start))
-    }
-
-    fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        let offset = offset.min(self.content.len());
-        self.selected_range = offset..offset;
-        self.selection_reversed = false;
-        cx.notify();
-    }
-
-    fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        let offset = offset.min(self.content.len());
-        if self.selection_reversed {
-            self.selected_range.start = offset;
-        } else {
-            self.selected_range.end = offset;
-        }
-        if self.selected_range.end < self.selected_range.start {
-            self.selection_reversed = !self.selection_reversed;
-            self.selected_range = self.selected_range.end..self.selected_range.start;
-        }
-        cx.notify();
-    }
-
-    fn previous_boundary(&self, offset: usize) -> usize {
-        self.content
-            .grapheme_indices(true)
-            .rev()
-            .find_map(|(index, _)| (index < offset).then_some(index))
-            .unwrap_or(0)
-    }
-
-    fn next_boundary(&self, offset: usize) -> usize {
-        self.content
-            .grapheme_indices(true)
-            .find_map(|(index, _)| (index > offset).then_some(index))
-            .unwrap_or(self.content.len())
-    }
-
-    fn offset_to_utf16(&self, offset: usize) -> usize {
-        self.content
-            .char_indices()
-            .take_while(|(index, _)| *index < offset)
-            .map(|(_, character)| character.len_utf16())
-            .sum()
-    }
-
-    fn offset_from_utf16(&self, offset: usize) -> usize {
-        utf8_offset_from_utf16(self.content.as_ref(), offset)
-    }
-
-    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
-    }
-
-    fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
-    }
-
-    fn move_vertical(&mut self, delta: isize, select: bool, cx: &mut Context<Self>) {
-        let starts = self.line_starts();
-        let cursor = self.cursor_offset();
-        let line = line_for_offset(&starts, cursor);
-        let column = cursor.saturating_sub(starts[line]);
-        let target = (line as isize + delta).clamp(0, starts.len() as isize - 1) as usize;
-        let target_end = line_end(&starts, target, self.content.len());
-        let target_offset = (starts[target] + column).min(target_end);
-        if select {
-            self.select_to(target_offset, cx);
-        } else {
-            self.move_to(target_offset, cx);
-        }
-    }
-
-    fn backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            let end = self.cursor_offset();
-            self.selected_range = self.previous_boundary(end)..end;
-        }
-        self.replace_selection("", cx);
-    }
-
-    fn delete(&mut self, _: &Delete, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            let start = self.cursor_offset();
-            self.selected_range = start..self.next_boundary(start);
-        }
-        self.replace_selection("", cx);
-    }
-
-    fn left(&mut self, _: &Left, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            self.move_to(self.previous_boundary(self.cursor_offset()), cx);
-        } else {
-            self.move_to(self.selected_range.start, cx);
-        }
-    }
-
-    fn right(&mut self, _: &Right, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            self.move_to(self.next_boundary(self.cursor_offset()), cx);
-        } else {
-            self.move_to(self.selected_range.end, cx);
-        }
-    }
-
-    fn up(&mut self, _: &Up, _window: &mut Window, cx: &mut Context<Self>) {
-        self.move_vertical(-1, false, cx);
-    }
-
-    fn down(&mut self, _: &Down, _window: &mut Window, cx: &mut Context<Self>) {
-        self.move_vertical(1, false, cx);
-    }
-
-    fn select_left(&mut self, _: &SelectLeft, _window: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.previous_boundary(self.cursor_offset()), cx);
-    }
-
-    fn select_right(&mut self, _: &SelectRight, _window: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.next_boundary(self.cursor_offset()), cx);
-    }
-
-    fn select_up(&mut self, _: &SelectUp, _window: &mut Window, cx: &mut Context<Self>) {
-        self.move_vertical(-1, true, cx);
-    }
-
-    fn select_down(&mut self, _: &SelectDown, _window: &mut Window, cx: &mut Context<Self>) {
-        self.move_vertical(1, true, cx);
-    }
-
-    fn select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
-        self.selected_range = 0..self.content.len();
-        self.selection_reversed = false;
-        cx.notify();
-    }
-
-    fn home(&mut self, _: &Home, _window: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.line_range(self.cursor_offset()).0, cx);
-    }
-
-    fn end(&mut self, _: &End, _window: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.line_range(self.cursor_offset()).1, cx);
-    }
-
-    fn paste(&mut self, _: &PasteText, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_selection(&text, cx);
-        }
-    }
-
-    fn copy(&mut self, _: &CopyText, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.selected_text()));
-        }
-    }
-
-    fn cut(&mut self, _: &CutText, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.selected_text()));
-            self.replace_selection("", cx);
-        }
-    }
-
-    fn on_mouse_down(
-        &mut self,
-        event: &MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.is_selecting = true;
-        let offset = self.index_for_mouse_position(event.position);
-        if event.modifiers.shift {
-            self.select_to(offset, cx);
-        } else {
-            self.move_to(offset, cx);
-        }
-    }
-
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, _: &mut Context<Self>) {
-        self.is_selecting = false;
-    }
-
-    fn on_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
-        }
-    }
-
-    fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
-        let Some(layout) = &self.last_layout else {
-            return 0;
-        };
-        let relative_y = position.y - layout.bounds.top();
-        let line = if relative_y <= px(0.) {
-            0
-        } else {
-            ((relative_y / layout.line_height).floor() as usize).min(layout.lines.len() - 1)
-        };
-        let x = (position.x - layout.bounds.left()).max(px(0.));
-        let byte_offset = layout.lines[line].closest_index_for_x(x);
-        let line_end = line_end(&layout.starts, line, self.content.len());
-        (layout.starts[line] + byte_offset).min(line_end)
-    }
-}
-
-impl EntityInputHandler for MarkdownInput {
-    fn text_for_range(
-        &mut self,
-        range_utf16: Range<usize>,
-        actual_range: &mut Option<Range<usize>>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<String> {
-        let range = self.range_from_utf16(&range_utf16);
-        actual_range.replace(self.range_to_utf16(&range));
-        Some(self.content[range].to_owned())
-    }
-
-    fn selected_text_range(
-        &mut self,
-        _ignore_disabled_input: bool,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<UTF16Selection> {
-        Some(UTF16Selection {
-            range: self.range_to_utf16(&self.selected_range),
-            reversed: self.selection_reversed,
-        })
-    }
-
-    fn marked_text_range(
-        &self,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<Range<usize>> {
-        self.marked_range
-            .as_ref()
-            .map(|range| self.range_to_utf16(range))
-    }
-
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.marked_range = None;
-    }
-
-    fn replace_text_in_range(
-        &mut self,
-        range_utf16: Option<Range<usize>>,
-        new_text: &str,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let range = range_utf16
-            .as_ref()
-            .map(|range| self.range_from_utf16(range))
-            .or_else(|| self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
-        self.replace_range_with_history(range, new_text, self.marked_range.is_none(), cx);
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        range_utf16: Option<Range<usize>>,
-        new_text: &str,
-        new_selected_range_utf16: Option<Range<usize>>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let range = range_utf16
-            .as_ref()
-            .map(|range| self.range_from_utf16(range))
-            .or_else(|| self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
-        let start = range.start;
-        let record_undo = self.marked_range.is_none();
-        self.replace_range_with_history(range, new_text, record_undo, cx);
-        self.marked_range = (!new_text.is_empty()).then_some(start..start + new_text.len());
-        if let Some(selected) = new_selected_range_utf16 {
-            let selected = utf16_range_to_utf8(new_text, &selected);
-            self.selected_range = start + selected.start..start + selected.end;
-        }
-        cx.notify();
-    }
-
-    fn bounds_for_range(
-        &mut self,
-        range_utf16: Range<usize>,
-        _bounds: Bounds<Pixels>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<Bounds<Pixels>> {
-        let layout = self.last_layout.as_ref()?;
-        let range = self.range_from_utf16(&range_utf16);
-        let line = line_for_offset(&layout.starts, range.start);
-        let start = layout.starts[line];
-        let x_start = layout.lines[line].x_for_index(range.start.saturating_sub(start));
-        let x_end = layout.lines[line].x_for_index(range.end.saturating_sub(start));
-        Some(Bounds::from_corners(
-            point(
-                layout.bounds.left() + x_start,
-                layout.bounds.top() + layout.line_height * line,
-            ),
-            point(
-                layout.bounds.left() + x_end,
-                layout.bounds.top() + layout.line_height * (line + 1),
-            ),
-        ))
-    }
-
-    fn character_index_for_point(
-        &mut self,
-        point: Point<Pixels>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<usize> {
-        Some(self.offset_to_utf16(self.index_for_mouse_position(point)))
-    }
-}
-
-struct MarkdownTextElement {
-    input: Entity<MarkdownInput>,
-}
-
-struct MarkdownPrepaint {
-    lines: Vec<ShapedLine>,
-    starts: Vec<usize>,
-    selections: Vec<PaintQuad>,
-    cursor: Option<PaintQuad>,
-}
-
-impl IntoElement for MarkdownTextElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl Element for MarkdownTextElement {
-    type RequestLayoutState = ();
-    type PrepaintState = MarkdownPrepaint;
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let line_count = self.input.read(cx).content.split('\n').count().max(1);
-        let mut style = Style::default();
-        style.size.width = relative(1.).into();
-        style.size.height = (line_count * window.line_height()).into();
-        (window.request_layout(style, [], cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Self::PrepaintState {
-        let input = self.input.read(cx);
-        let content = input.content.clone();
-        let starts = line_starts(content.as_ref());
-        let line_height = window.line_height();
-        let style = window.text_style();
-        let color = style.color;
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let display_lines: Vec<SharedString> = if content.is_empty() {
-            vec!["开始输入 Markdown…".into()]
-        } else {
-            content
-                .split('\n')
-                .map(|line| {
-                    if input.masked {
-                        SharedString::from("*".repeat(line.len()))
-                    } else {
-                        SharedString::from(line.to_owned())
-                    }
-                })
-                .collect()
-        };
-        let placeholder = content.is_empty();
-        let lines: Vec<ShapedLine> = display_lines
-            .into_iter()
-            .map(|line| {
-                let text_color = if placeholder {
-                    color.opacity(0.45)
-                } else {
-                    color
-                };
-                window.text_system().shape_line(
-                    line.clone(),
-                    font_size,
-                    &[TextRun {
-                        len: line.len(),
-                        font: style.font(),
-                        color: text_color,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    }],
-                    None,
-                )
-            })
-            .collect();
-
-        let mut selections = Vec::new();
-        if !placeholder && !input.selected_range.is_empty() {
-            for (line_index, line) in lines.iter().enumerate() {
-                let start = starts[line_index];
-                let end = line_end(&starts, line_index, content.len());
-                let selected_start = input.selected_range.start.max(start);
-                let selected_end = input.selected_range.end.min(end);
-                if selected_start < selected_end {
-                    selections.push(fill(
-                        Bounds::from_corners(
-                            point(
-                                bounds.left() + line.x_for_index(selected_start - start),
-                                bounds.top() + line_height * line_index,
-                            ),
-                            point(
-                                bounds.left() + line.x_for_index(selected_end - start),
-                                bounds.top() + line_height * (line_index + 1),
-                            ),
-                        ),
-                        hsla(0.58, 0.65, 0.75, 0.35),
-                    ));
-                }
-            }
-        }
-
-        let cursor = if input.selected_range.is_empty() {
-            let cursor = input.cursor_offset();
-            let line_index = line_for_offset(&starts, cursor).min(lines.len() - 1);
-            let start = starts.get(line_index).copied().unwrap_or(0);
-            Some(fill(
-                Bounds::new(
-                    point(
-                        bounds.left() + lines[line_index].x_for_index(cursor.saturating_sub(start)),
-                        bounds.top() + line_height * line_index,
-                    ),
-                    size(px(1.5), line_height),
-                ),
-                rgb(BLUE),
-            ))
-        } else {
-            None
-        };
-
-        MarkdownPrepaint {
-            lines,
-            starts,
-            selections,
-            cursor,
-        }
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let focus_handle = self.input.read(cx).focus_handle.clone();
-        window.handle_input(
-            &focus_handle,
-            ElementInputHandler::new(bounds, self.input.clone()),
-            cx,
-        );
-        for selection in prepaint.selections.drain(..) {
-            window.paint_quad(selection);
-        }
-        let line_height = window.line_height();
-        for (line_index, line) in prepaint.lines.iter().enumerate() {
-            let origin = point(bounds.left(), bounds.top() + line_height * line_index);
-            let _ = line.paint(origin, line_height, window, cx);
-        }
-        if focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
-        self.input.update(cx, |input, _| {
-            input.last_layout = Some(EditorLayout {
-                lines: prepaint.lines.clone(),
-                starts: prepaint.starts.clone(),
-                bounds,
-                line_height,
-            });
-        });
+        self.undo_stack.push(self.content.clone());
+        self.restore_content(next, cx);
     }
 }
 
 impl Render for MarkdownInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .w_full()
-            .key_context("MarkdownInput")
-            .track_focus(&self.focus_handle(cx))
-            .cursor(CursorStyle::IBeam)
-            .on_action(cx.listener(Self::backspace))
-            .on_action(cx.listener(Self::delete))
-            .on_action(cx.listener(Self::left))
-            .on_action(cx.listener(Self::right))
-            .on_action(cx.listener(Self::up))
-            .on_action(cx.listener(Self::down))
-            .on_action(cx.listener(Self::select_left))
-            .on_action(cx.listener(Self::select_right))
-            .on_action(cx.listener(Self::select_up))
-            .on_action(cx.listener(Self::select_down))
-            .on_action(cx.listener(Self::select_all))
-            .on_action(cx.listener(Self::home))
-            .on_action(cx.listener(Self::end))
-            .on_action(cx.listener(Self::paste))
-            .on_action(cx.listener(Self::copy))
-            .on_action(cx.listener(Self::cut))
-            .on_action(cx.listener(Self::undo))
-            .on_action(cx.listener(Self::redo))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .text_size(px(16.))
-            .line_height(px(28.))
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_pending(window, cx);
+        let mut input = Input::new(&self.state)
+            .appearance(false)
+            .bordered(false)
+            .focus_bordered(false)
             .text_color(rgb(TEXT))
-            .child(MarkdownTextElement { input: cx.entity() })
+            .text_size(if self.multi_line { px(16.) } else { px(14.) });
+        if self.multi_line {
+            input = input.h_full().line_height(px(28.));
+        }
+        div()
+            .w_full()
+            .when(self.multi_line, |this| this.h_full())
+            .child(input)
     }
 }
 
 impl Focusable for MarkdownInput {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.state.read(cx).focus_handle(cx)
     }
 }
 
@@ -809,6 +287,8 @@ struct MarkdownEditor {
     path: Option<PathBuf>,
     preview: bool,
     active_tab: usize,
+    split_ratio: f32,
+    splitter_dragging: bool,
     settings_visible: bool,
     dirty: bool,
     status: SharedString,
@@ -828,38 +308,17 @@ enum PendingOperation {
 
 impl MarkdownEditor {
     fn new_settings_input(
+        window: &mut Window,
         cx: &mut Context<Self>,
         content: String,
         masked: bool,
     ) -> Entity<MarkdownInput> {
-        cx.new(|cx| MarkdownInput {
-            focus_handle: cx.focus_handle(),
-            content: content.into(),
-            masked,
-            selected_range: 0..0,
-            selection_reversed: false,
-            marked_range: None,
-            last_layout: None,
-            is_selecting: false,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
-        })
+        cx.new(|cx| MarkdownInput::new(window, cx, content, masked, false))
     }
 
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let initial = DEFAULT_MARKDOWN.to_owned();
-        let text_input = cx.new(|cx| MarkdownInput {
-            focus_handle: cx.focus_handle(),
-            content: initial.clone().into(),
-            masked: false,
-            selected_range: 0..0,
-            selection_reversed: false,
-            marked_range: None,
-            last_layout: None,
-            is_selecting: false,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
-        });
+        let text_input = cx.new(|cx| MarkdownInput::new(window, cx, initial.clone(), false, true));
         let publish_settings = StoredPublishSettings {
             notion_token: std::env::var("OPEN_LIVE_WRITER_NOTION_TOKEN").unwrap_or_default(),
             notion_parent_page_id: std::env::var("OPEN_LIVE_WRITER_NOTION_PARENT_PAGE_ID")
@@ -872,15 +331,23 @@ impl MarkdownEditor {
                 .unwrap_or_default(),
         };
         let notion_token_input =
-            Self::new_settings_input(cx, publish_settings.notion_token.clone(), true);
-        let notion_parent_input =
-            Self::new_settings_input(cx, publish_settings.notion_parent_page_id.clone(), false);
-        let typecho_url_input =
-            Self::new_settings_input(cx, publish_settings.typecho_xmlrpc_url.clone(), false);
+            Self::new_settings_input(window, cx, publish_settings.notion_token.clone(), true);
+        let notion_parent_input = Self::new_settings_input(
+            window,
+            cx,
+            publish_settings.notion_parent_page_id.clone(),
+            false,
+        );
+        let typecho_url_input = Self::new_settings_input(
+            window,
+            cx,
+            publish_settings.typecho_xmlrpc_url.clone(),
+            false,
+        );
         let typecho_username_input =
-            Self::new_settings_input(cx, publish_settings.typecho_username.clone(), false);
+            Self::new_settings_input(window, cx, publish_settings.typecho_username.clone(), false);
         let typecho_password_input =
-            Self::new_settings_input(cx, publish_settings.typecho_password.clone(), true);
+            Self::new_settings_input(window, cx, publish_settings.typecho_password.clone(), true);
         let subscription = cx.observe(&text_input, |editor, input, cx| {
             if editor.suppress_observer {
                 return;
@@ -903,6 +370,8 @@ impl MarkdownEditor {
             path: None,
             preview: false,
             active_tab: 0,
+            split_ratio: 0.38,
+            splitter_dragging: false,
             settings_visible: false,
             dirty: false,
             status: "就绪 · Markdown 模式".into(),
@@ -1321,60 +790,82 @@ impl MarkdownEditor {
         self.publish_to_typecho(&PublishToTypecho, window, cx);
     }
 
-    fn apply_format(&mut self, prefix: &str, suffix: &str, message: &str, cx: &mut Context<Self>) {
-        self.text_input
-            .update(cx, |input, cx| input.wrap_selection(prefix, suffix, cx));
+    fn apply_format(
+        &mut self,
+        prefix: &str,
+        suffix: &str,
+        message: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.text_input.update(cx, |input, cx| {
+            input.wrap_selection(prefix, suffix, window, cx)
+        });
         self.status = message.to_owned().into();
         cx.notify();
     }
 
-    fn apply_prefix(&mut self, prefix: &str, message: &str, cx: &mut Context<Self>) {
-        self.text_input
-            .update(cx, |input, cx| input.prefix_current_line(prefix, cx));
+    fn apply_prefix(
+        &mut self,
+        prefix: &str,
+        message: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.text_input.update(cx, |input, cx| {
+            input.prefix_current_line(prefix, window, cx)
+        });
         self.status = message.to_owned().into();
         cx.notify();
     }
 
-    fn bold_action(&mut self, _: &BoldText, _window: &mut Window, cx: &mut Context<Self>) {
-        self.apply_format("**", "**", "已插入粗体 Markdown", cx);
+    fn bold_action(&mut self, _: &BoldText, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_format("**", "**", "已插入粗体 Markdown", window, cx);
     }
 
-    fn italic_action(&mut self, _: &ItalicText, _window: &mut Window, cx: &mut Context<Self>) {
-        self.apply_format("*", "*", "已插入斜体 Markdown", cx);
+    fn italic_action(&mut self, _: &ItalicText, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_format("*", "*", "已插入斜体 Markdown", window, cx);
     }
 
-    fn heading_action(&mut self, _: &HeadingText, _window: &mut Window, cx: &mut Context<Self>) {
-        self.apply_prefix("# ", "已插入一级标题", cx);
+    fn heading_action(&mut self, _: &HeadingText, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_prefix("# ", "已插入一级标题", window, cx);
     }
 
-    fn bullets_action(&mut self, _: &BulletsText, _window: &mut Window, cx: &mut Context<Self>) {
-        self.apply_prefix("- ", "已插入无序列表", cx);
+    fn bullets_action(&mut self, _: &BulletsText, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_prefix("- ", "已插入无序列表", window, cx);
     }
 
-    fn quote_action(&mut self, _: &QuoteText, _window: &mut Window, cx: &mut Context<Self>) {
-        self.apply_prefix("> ", "已插入引用", cx);
+    fn quote_action(&mut self, _: &QuoteText, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_prefix("> ", "已插入引用", window, cx);
     }
 
-    fn link_action(&mut self, _: &LinkText, _window: &mut Window, cx: &mut Context<Self>) {
-        self.apply_format("[", "](https://example.com)", "已插入链接 Markdown", cx);
+    fn link_action(&mut self, _: &LinkText, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_format(
+            "[",
+            "](https://example.com)",
+            "已插入链接 Markdown",
+            window,
+            cx,
+        );
     }
 
     fn insert_snippet(&mut self, snippet: String, message: &'static str, cx: &mut Context<Self>) {
         self.text_input
-            .update(cx, |input, cx| input.replace_selection(&snippet, cx));
+            .update(cx, |input, cx| input.queue_insert(snippet, cx));
         self.status = message.into();
         cx.notify();
     }
 
-    fn strike_action(&mut self, _: &StrikeText, _window: &mut Window, cx: &mut Context<Self>) {
-        self.apply_format("~~", "~~", "已插入删除线 Markdown", cx);
+    fn strike_action(&mut self, _: &StrikeText, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_format("~~", "~~", "已插入删除线 Markdown", window, cx);
     }
 
-    fn code_action(&mut self, _: &CodeText, _window: &mut Window, cx: &mut Context<Self>) {
+    fn code_action(&mut self, _: &CodeText, window: &mut Window, cx: &mut Context<Self>) {
         self.apply_format(
             INLINE_CODE_MARKER,
             INLINE_CODE_MARKER,
             "已插入行内代码 Markdown",
+            window,
             cx,
         );
     }
@@ -1428,16 +919,14 @@ impl MarkdownEditor {
         self.insert_snippet("\n---\n".to_owned(), "已插入分隔线 Markdown", cx);
     }
 
-    fn undo_action(&mut self, _: &UndoText, window: &mut Window, cx: &mut Context<Self>) {
-        self.text_input
-            .update(cx, |input, cx| input.undo(&UndoText, window, cx));
+    fn undo_action(&mut self, _: &UndoText, _window: &mut Window, cx: &mut Context<Self>) {
+        self.text_input.update(cx, |input, cx| input.undo(cx));
         self.status = "已撤销".into();
         cx.notify();
     }
 
-    fn redo_action(&mut self, _: &RedoText, window: &mut Window, cx: &mut Context<Self>) {
-        self.text_input
-            .update(cx, |input, cx| input.redo(&RedoText, window, cx));
+    fn redo_action(&mut self, _: &RedoText, _window: &mut Window, cx: &mut Context<Self>) {
+        self.text_input.update(cx, |input, cx| input.redo(cx));
         self.status = "已重做".into();
         cx.notify();
     }
@@ -1448,10 +937,10 @@ impl MarkdownEditor {
         suffix: &'static str,
         message: &'static str,
         _: &gpui::ClickEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_format(prefix, suffix, message, cx);
+        self.apply_format(prefix, suffix, message, window, cx);
     }
 
     fn prefix_button(
@@ -1459,10 +948,10 @@ impl MarkdownEditor {
         prefix: &'static str,
         message: &'static str,
         _: &gpui::ClickEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_prefix(prefix, message, cx);
+        self.apply_prefix(prefix, message, window, cx);
     }
 
     fn undo_click(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1471,6 +960,371 @@ impl MarkdownEditor {
 
     fn redo_click(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.redo_action(&RedoText, window, cx);
+    }
+
+    fn splitter_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button == MouseButton::Left {
+            self.splitter_dragging = true;
+            window.set_window_cursor_style(CursorStyle::ResizeLeftRight);
+            cx.notify();
+        }
+    }
+
+    fn splitter_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.splitter_dragging || !event.dragging() {
+            return;
+        }
+        let window_width: f32 = window.bounds().size.width.into();
+        if window_width <= 0. {
+            return;
+        }
+        let ratio = (f32::from(event.position.x) / window_width).clamp(0.22, 0.74);
+        if (ratio - self.split_ratio).abs() > 0.002 {
+            self.split_ratio = ratio;
+            cx.notify();
+        }
+    }
+
+    fn splitter_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button == MouseButton::Left && self.splitter_dragging {
+            self.splitter_dragging = false;
+            window.set_window_cursor_style(CursorStyle::Arrow);
+            cx.notify();
+        }
+    }
+
+    fn ribbon(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.active_tab {
+            0 => div()
+                .h(RIBBON_HEIGHT)
+                .w_full()
+                .flex()
+                .id("ribbon-home-scroll")
+                .overflow_x_scroll()
+                .bg(rgb(RIBBON_BLUE))
+                .border_b_1()
+                .border_color(rgb(BORDER))
+                .px_2()
+                .child(ribbon_group(
+                    "文档",
+                    ribbon_controls!(
+                        ribbon_button(
+                            "icons/new.png",
+                            "新建",
+                            cx.listener(Self::new_document_click),
+                        ),
+                        ribbon_button(
+                            "icons/open.png",
+                            "打开",
+                            cx.listener(Self::open_document_click),
+                        ),
+                        ribbon_button(
+                            "icons/save.png",
+                            "保存",
+                            cx.listener(Self::save_document_click),
+                        ),
+                        ribbon_button(
+                            "icons/open-draft.png",
+                            "打开草稿",
+                            cx.listener(Self::open_draft_click),
+                        ),
+                        ribbon_button(
+                            "icons/save-draft.png",
+                            "保存草稿",
+                            cx.listener(Self::save_draft_click),
+                        ),
+                    ),
+                ))
+                .child(ribbon_group(
+                    "文本",
+                    ribbon_controls!(
+                        ribbon_button(
+                            "icons/bold.png",
+                            "粗体",
+                            cx.listener(|editor, event, window, cx| {
+                                editor.format_button(
+                                    "**",
+                                    "**",
+                                    "已插入粗体 Markdown",
+                                    event,
+                                    window,
+                                    cx,
+                                )
+                            }),
+                        ),
+                        ribbon_button(
+                            "icons/italic.png",
+                            "斜体",
+                            cx.listener(|editor, event, window, cx| {
+                                editor.format_button(
+                                    "*",
+                                    "*",
+                                    "已插入斜体 Markdown",
+                                    event,
+                                    window,
+                                    cx,
+                                )
+                            }),
+                        ),
+                        ribbon_button(
+                            "icons/strike.png",
+                            "删除线",
+                            cx.listener(|editor, _event, window, cx| {
+                                editor.strike_action(&StrikeText, window, cx)
+                            }),
+                        ),
+                        ribbon_button(
+                            "icons/code.png",
+                            "代码",
+                            cx.listener(|editor, _event, window, cx| {
+                                editor.code_action(&CodeText, window, cx)
+                            }),
+                        ),
+                    ),
+                ))
+                .child(ribbon_group(
+                    "段落",
+                    ribbon_controls!(
+                        ribbon_button(
+                            "icons/bullets.png",
+                            "列表",
+                            cx.listener(|editor, event, window, cx| {
+                                editor.prefix_button("- ", "已插入无序列表", event, window, cx)
+                            }),
+                        ),
+                        ribbon_button(
+                            "icons/blockquote.png",
+                            "引用",
+                            cx.listener(|editor, event, window, cx| {
+                                editor.prefix_button("> ", "已插入引用", event, window, cx)
+                            }),
+                        ),
+                        ribbon_button(
+                            "icons/heading.png",
+                            "标题",
+                            cx.listener(|editor, event, window, cx| {
+                                editor.prefix_button("# ", "已插入一级标题", event, window, cx)
+                            }),
+                        ),
+                        ribbon_button(
+                            "icons/link.png",
+                            "链接",
+                            cx.listener(|editor, _event, window, cx| {
+                                editor.link_action(&LinkText, window, cx)
+                            }),
+                        ),
+                    ),
+                ))
+                .child(ribbon_group(
+                    "历史记录",
+                    ribbon_controls!(
+                        ribbon_button("icons/undo.png", "撤销", cx.listener(Self::undo_click)),
+                        ribbon_button("icons/redo.png", "重做", cx.listener(Self::redo_click)),
+                    ),
+                ))
+                .child(ribbon_group(
+                    "文章",
+                    ribbon_controls!(
+                        ribbon_button(
+                            "icons/settings.png",
+                            "设置",
+                            cx.listener(|editor, _event, window, cx| {
+                                editor.toggle_settings(&ToggleSettings, window, cx)
+                            }),
+                        ),
+                        ribbon_button(
+                            "icons/notion.png",
+                            "Notion",
+                            cx.listener(Self::publish_to_notion_click),
+                        ),
+                        ribbon_button(
+                            "icons/typecho.png",
+                            "Typecho",
+                            cx.listener(Self::publish_to_typecho_click),
+                        ),
+                        ribbon_button(
+                            "icons/preview.png",
+                            if self.preview { "编辑" } else { "预览" },
+                            cx.listener(Self::toggle_preview_click),
+                        ),
+                    ),
+                ))
+                .into_any_element(),
+            1 => div()
+                .h(RIBBON_HEIGHT)
+                .w_full()
+                .flex()
+                .id("ribbon-insert-scroll")
+                .overflow_x_scroll()
+                .bg(rgb(RIBBON_BLUE))
+                .border_b_1()
+                .border_color(rgb(BORDER))
+                .px_2()
+                .child(ribbon_group(
+                    "Markdown",
+                    ribbon_controls!(
+                        ribbon_button(
+                            "icons/heading.png",
+                            "标题",
+                            cx.listener(|editor, event, window, cx| {
+                                editor.prefix_button("# ", "已插入一级标题", event, window, cx)
+                            }),
+                        ),
+                        ribbon_button(
+                            "icons/bullets.png",
+                            "列表",
+                            cx.listener(|editor, event, window, cx| {
+                                editor.prefix_button("- ", "已插入无序列表", event, window, cx)
+                            }),
+                        ),
+                        ribbon_button(
+                            "icons/blockquote.png",
+                            "引用",
+                            cx.listener(|editor, event, window, cx| {
+                                editor.prefix_button("> ", "已插入引用", event, window, cx)
+                            }),
+                        ),
+                        ribbon_button(
+                            "icons/link.png",
+                            "链接",
+                            cx.listener(|editor, _event, window, cx| {
+                                editor.link_action(&LinkText, window, cx)
+                            }),
+                        ),
+                        ribbon_button(
+                            "icons/strike.png",
+                            "删除线",
+                            cx.listener(|editor, _event, window, cx| {
+                                editor.strike_action(&StrikeText, window, cx)
+                            }),
+                        ),
+                        ribbon_button(
+                            "icons/code.png",
+                            "代码",
+                            cx.listener(|editor, _event, window, cx| {
+                                editor.code_action(&CodeText, window, cx)
+                            }),
+                        ),
+                    ),
+                ))
+                .child(ribbon_group(
+                    "媒体",
+                    ribbon_controls!(
+                        ribbon_button(
+                            "icons/image.png",
+                            "图片",
+                            cx.listener(|editor, _event, window, cx| {
+                                editor.image_action(&ImageText, window, cx)
+                            }),
+                        ),
+                        ribbon_button(
+                            "icons/video.png",
+                            "视频",
+                            cx.listener(|editor, _event, window, cx| {
+                                editor.video_action(&VideoText, window, cx)
+                            }),
+                        ),
+                    ),
+                ))
+                .child(ribbon_group(
+                    "结构",
+                    ribbon_controls!(
+                        ribbon_button(
+                            "icons/table.png",
+                            "表格",
+                            cx.listener(|editor, _event, window, cx| {
+                                editor.table_action(&TableText, window, cx)
+                            }),
+                        ),
+                        ribbon_button(
+                            "icons/divider.png",
+                            "分隔线",
+                            cx.listener(|editor, _event, window, cx| {
+                                editor.divider_action(&DividerText, window, cx)
+                            }),
+                        ),
+                    ),
+                ))
+                .into_any_element(),
+            _ => div()
+                .h(RIBBON_HEIGHT)
+                .w_full()
+                .flex()
+                .id("ribbon-blog-scroll")
+                .overflow_x_scroll()
+                .bg(rgb(RIBBON_BLUE))
+                .border_b_1()
+                .border_color(rgb(BORDER))
+                .px_2()
+                .child(ribbon_group(
+                    "草稿",
+                    ribbon_controls!(
+                        ribbon_button(
+                            "icons/new.png",
+                            "新建",
+                            cx.listener(Self::new_document_click),
+                        ),
+                        ribbon_button(
+                            "icons/open-draft.png",
+                            "打开草稿",
+                            cx.listener(Self::open_draft_click),
+                        ),
+                        ribbon_button(
+                            "icons/save-draft.png",
+                            "保存草稿",
+                            cx.listener(Self::save_draft_click),
+                        ),
+                    ),
+                ))
+                .child(ribbon_group(
+                    "发布",
+                    ribbon_controls!(
+                        ribbon_button(
+                            "icons/notion.png",
+                            "Notion",
+                            cx.listener(Self::publish_to_notion_click),
+                        ),
+                        ribbon_button(
+                            "icons/typecho.png",
+                            "Typecho",
+                            cx.listener(Self::publish_to_typecho_click),
+                        ),
+                    ),
+                ))
+                .child(ribbon_group(
+                    "查看",
+                    ribbon_controls!(
+                        ribbon_button(
+                            "icons/preview.png",
+                            if self.preview { "编辑" } else { "预览" },
+                            cx.listener(Self::toggle_preview_click),
+                        ),
+                        ribbon_button(
+                            "icons/settings.png",
+                            "设置",
+                            cx.listener(|editor, _event, window, cx| {
+                                editor.toggle_settings(&ToggleSettings, window, cx)
+                            }),
+                        ),
+                    ),
+                ))
+                .into_any_element(),
+        }
     }
 }
 
@@ -1515,14 +1369,40 @@ impl Render for MarkdownEditor {
         } else {
             div()
                 .flex()
+                .flex_row()
                 .flex_grow()
                 .min_h_0()
                 .w_full()
                 .p_3()
                 .gap_3()
-                .child(editor_panel(self.text_input.clone()))
+                .on_mouse_move(cx.listener(Self::splitter_mouse_move))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::splitter_mouse_up))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(Self::splitter_mouse_up))
+                .child(editor_panel(
+                    self.text_input.clone(),
+                    Some(self.split_ratio),
+                ))
+                .child(
+                    div()
+                        .id("editor-preview-splitter")
+                        .w(px(6.))
+                        .h_full()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .on_mouse_down(MouseButton::Left, cx.listener(Self::splitter_mouse_down))
+                        .hover(|style| style.bg(rgb(0xd5e5f2)).cursor(CursorStyle::ResizeLeftRight))
+                        .child(div().w(px(1.)).h_full().bg(rgb(if self.splitter_dragging {
+                            BLUE
+                        } else {
+                            BORDER
+                        }))),
+                )
                 .child(preview_panel(content.clone(), "预览 · 实时 Markdown"))
         };
+        let ribbon = self.ribbon(cx);
 
         div()
             .size_full()
@@ -1555,10 +1435,9 @@ impl Render for MarkdownEditor {
             .on_action(cx.listener(Self::quit_application))
             .on_action(cx.listener(Self::publish_to_notion))
             .on_action(cx.listener(Self::publish_to_typecho))
-            .child(title_bar(&title))
             .child(
                 div()
-                    .h(px(28.))
+                    .h(RIBBON_TAB_HEIGHT)
                     .w_full()
                     .flex()
                     .items_center()
@@ -1590,188 +1469,7 @@ impl Render for MarkdownEditor {
                         }),
                     )),
             )
-            .child(
-                div()
-                    .h(px(92.))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .bg(rgb(RIBBON_BLUE))
-                    .border_b_1()
-                    .border_color(rgb(BORDER))
-                    .px_3()
-                    .child(ribbon_button(
-                        "icons/new.png",
-                        "新建",
-                        cx.listener(Self::new_document_click),
-                    ))
-                    .child(ribbon_button(
-                        "icons/open.png",
-                        "打开",
-                        cx.listener(Self::open_document_click),
-                    ))
-                    .child(ribbon_button(
-                        "icons/save.png",
-                        "保存",
-                        cx.listener(Self::save_document_click),
-                    ))
-                    .child(ribbon_button(
-                        "icons/open.png",
-                        "打开草稿",
-                        cx.listener(Self::open_draft_click),
-                    ))
-                    .child(ribbon_button(
-                        "icons/save.png",
-                        "保存草稿",
-                        cx.listener(Self::save_draft_click),
-                    ))
-                    .child(separator())
-                    .child(ribbon_button(
-                        "icons/bold.png",
-                        "粗体",
-                        cx.listener(|editor, event, window, cx| {
-                            editor.format_button(
-                                "**",
-                                "**",
-                                "已插入粗体 Markdown",
-                                event,
-                                window,
-                                cx,
-                            )
-                        }),
-                    ))
-                    .child(ribbon_button(
-                        "icons/italic.png",
-                        "斜体",
-                        cx.listener(|editor, event, window, cx| {
-                            editor.format_button("*", "*", "已插入斜体 Markdown", event, window, cx)
-                        }),
-                    ))
-                    .child(ribbon_button(
-                        "icons/bullets.png",
-                        "列表",
-                        cx.listener(|editor, event, window, cx| {
-                            editor.prefix_button("- ", "已插入无序列表", event, window, cx)
-                        }),
-                    ))
-                    .child(ribbon_button(
-                        "icons/blockquote.png",
-                        "引用",
-                        cx.listener(|editor, event, window, cx| {
-                            editor.prefix_button("> ", "已插入引用", event, window, cx)
-                        }),
-                    ))
-                    .child(ribbon_button(
-                        "icons/heading.png",
-                        "标题",
-                        cx.listener(|editor, event, window, cx| {
-                            editor.prefix_button("# ", "已插入一级标题", event, window, cx)
-                        }),
-                    ))
-                    .child(ribbon_button(
-                        "icons/link.png",
-                        "链接",
-                        cx.listener(|editor, _event, window, cx| {
-                            editor.link_action(&LinkText, window, cx)
-                        }),
-                    ))
-                    .child(separator())
-                    .child(ribbon_button(
-                        "icons/undo.png",
-                        "撤销",
-                        cx.listener(Self::undo_click),
-                    ))
-                    .child(ribbon_button(
-                        "icons/redo.png",
-                        "重做",
-                        cx.listener(Self::redo_click),
-                    ))
-                    .child(div().flex_grow())
-                    .child(ribbon_button(
-                        "icons/settings.png",
-                        "设置",
-                        cx.listener(|editor, _event, window, cx| {
-                            editor.toggle_settings(&ToggleSettings, window, cx)
-                        }),
-                    ))
-                    .child(ribbon_button(
-                        "icons/notion.png",
-                        "复制到 Notion",
-                        cx.listener(Self::publish_to_notion_click),
-                    ))
-                    .child(ribbon_button(
-                        "icons/typecho.png",
-                        "发布 Typecho",
-                        cx.listener(Self::publish_to_typecho_click),
-                    ))
-                    .child(ribbon_button(
-                        "icons/preview.png",
-                        if self.preview { "编辑" } else { "预览" },
-                        cx.listener(Self::toggle_preview_click),
-                    )),
-            )
-            .child(
-                div()
-                    .h(px(76.))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .bg(rgb(0xf1f6fb))
-                    .border_b_1()
-                    .border_color(rgb(BORDER))
-                    .px_3()
-                    .child(
-                        div()
-                            .w(px(92.))
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("Markdown 插入"),
-                    )
-                    .child(ribbon_button(
-                        "icons/strike.png",
-                        "删除线",
-                        cx.listener(|editor, _event, window, cx| {
-                            editor.strike_action(&StrikeText, window, cx)
-                        }),
-                    ))
-                    .child(ribbon_button(
-                        "icons/code.png",
-                        "代码",
-                        cx.listener(|editor, _event, window, cx| {
-                            editor.code_action(&CodeText, window, cx)
-                        }),
-                    ))
-                    .child(ribbon_button(
-                        "icons/image.png",
-                        "图片",
-                        cx.listener(|editor, _event, window, cx| {
-                            editor.image_action(&ImageText, window, cx)
-                        }),
-                    ))
-                    .child(ribbon_button(
-                        "icons/table.png",
-                        "表格",
-                        cx.listener(|editor, _event, window, cx| {
-                            editor.table_action(&TableText, window, cx)
-                        }),
-                    ))
-                    .child(ribbon_button(
-                        "icons/video.png",
-                        "视频",
-                        cx.listener(|editor, _event, window, cx| {
-                            editor.video_action(&VideoText, window, cx)
-                        }),
-                    ))
-                    .child(ribbon_button(
-                        "icons/preview.png",
-                        "分隔线",
-                        cx.listener(|editor, _event, window, cx| {
-                            editor.divider_action(&DividerText, window, cx)
-                        }),
-                    )),
-            )
+            .child(ribbon)
             .child(workspace)
             .child(
                 div()
@@ -1825,12 +1523,6 @@ fn utf16_range_to_utf8(text: &str, range: &Range<usize>) -> Range<usize> {
     utf8_offset_from_utf16(text, range.start)..utf8_offset_from_utf16(text, range.end)
 }
 
-fn line_for_offset(starts: &[usize], offset: usize) -> usize {
-    starts
-        .partition_point(|start| *start <= offset)
-        .saturating_sub(1)
-}
-
 fn line_end(starts: &[usize], line: usize, content_len: usize) -> usize {
     starts
         .get(line + 1)
@@ -1865,34 +1557,8 @@ fn markdown_image_url(path: &Path) -> String {
     }
 }
 
-fn title_bar(title: &str) -> impl IntoElement {
-    div()
-        .h(px(42.))
-        .w_full()
-        .flex()
-        .items_center()
-        .gap_2()
-        .bg(rgb(DARK_BLUE))
-        .px_3()
-        .text_color(white())
-        .child(img("title-bar-logo.png").size_4())
-        .child(
-            div()
-                .font_weight(FontWeight(600.))
-                .child("Open Live Writer"),
-        )
-        .child(div().text_color(hsla(0., 0., 1., 0.7)).child("· Markdown"))
-        .child(div().flex_grow())
-        .child(
-            div()
-                .text_sm()
-                .text_color(hsla(0., 0., 1., 0.85))
-                .child(title.to_owned()),
-        )
-}
-
-fn editor_panel(input: Entity<MarkdownInput>) -> impl IntoElement {
-    div()
+fn editor_panel(input: Entity<MarkdownInput>, width: Option<f32>) -> impl IntoElement {
+    let mut panel = div()
         .flex()
         .flex_col()
         .flex_grow()
@@ -1901,7 +1567,11 @@ fn editor_panel(input: Entity<MarkdownInput>) -> impl IntoElement {
         .bg(white())
         .border_1()
         .border_color(rgb(BORDER))
-        .shadow_sm()
+        .shadow_sm();
+    if let Some(width) = width {
+        panel = panel.w(relative(width)).flex_none();
+    }
+    panel
         .child(
             div()
                 .h(px(32.))
@@ -2111,21 +1781,52 @@ fn tab(
     };
     div()
         .id(label)
-        .h(px(24.))
+        .h(RIBBON_TAB_HEIGHT)
         .px_3()
         .flex()
         .items_center()
-        .rounded_sm()
+        .rounded_t_sm()
         .bg(background)
-        .text_sm()
+        .text_size(px(14.))
         .text_color(foreground)
-        .hover(|style| style.bg(rgb(0xd4e3f2)).cursor_pointer())
+        .hover(|style| {
+            style
+                .bg(if active { rgb(0xffffff) } else { rgb(0x568ac0) })
+                .cursor_pointer()
+        })
+        .active(|style| style.bg(rgb(0xd7e8f6)))
         .on_click(on_click)
         .child(label)
 }
 
-fn separator() -> impl IntoElement {
-    div().h(px(54.)).w(px(1.)).bg(rgb(BORDER)).mx_1()
+fn ribbon_group(label: &'static str, controls: impl IntoElement) -> impl IntoElement {
+    div()
+        .h_full()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .px_1()
+        .border_r_1()
+        .border_color(rgb(RIBBON_SEPARATOR))
+        .child(
+            div()
+                .flex()
+                .flex_grow()
+                .items_center()
+                .justify_center()
+                .child(controls),
+        )
+        .child(
+            div()
+                .h(px(16.))
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child(label),
+        )
 }
 
 fn ribbon_button(
@@ -2135,20 +1836,69 @@ fn ribbon_button(
 ) -> impl IntoElement {
     div()
         .id(label)
-        .w(px(64.))
-        .h(px(70.))
+        .w(RIBBON_BUTTON_WIDTH)
+        .h(RIBBON_BUTTON_HEIGHT)
         .flex()
         .flex_col()
+        .flex_none()
         .items_center()
         .justify_center()
         .gap_1()
+        .px_1()
         .rounded_sm()
+        .border_1()
+        .border_color(hsla(0., 0., 0., 0.))
         .text_xs()
         .text_color(rgb(TEXT))
-        .hover(|style| style.bg(rgb(0xd4e3f2)).cursor_pointer())
+        .hover(|style| {
+            style
+                .bg(linear_gradient(
+                    0.,
+                    linear_color_stop(rgb(0xffffff), 0.),
+                    linear_color_stop(rgb(0xd9eaf8), 1.),
+                ))
+                .border_color(rgb(0x8db6d9))
+                .shadow_sm()
+                .cursor_pointer()
+        })
+        .active(|style| {
+            style
+                .bg(linear_gradient(
+                    0.,
+                    linear_color_stop(rgb(0xb8d3eb), 0.),
+                    linear_color_stop(rgb(0xe7f3fc), 1.),
+                ))
+                .border_color(rgb(0x5b91c2))
+                .shadow_none()
+        })
         .on_click(on_click)
-        .child(img(icon).size_5())
-        .child(label)
+        .child(
+            div()
+                .w(px(20.))
+                .h(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(ribbon_icon(icon).size_4()),
+        )
+        .child(
+            div()
+                .h(px(18.))
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_center()
+                .child(label),
+        )
+}
+
+fn ribbon_icon(path: &'static str) -> Img {
+    let asset = EmbeddedAssets::get(path).expect("missing embedded ribbon icon");
+    img(Arc::new(Image::from_bytes(
+        ImageFormat::Png,
+        asset.data.into_owned(),
+    )))
 }
 
 fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
@@ -2365,6 +2115,7 @@ fn preview_inline_piece(text: &str, style: Option<&str>) -> gpui::AnyElement {
 
 fn main() {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
+        gpui_component::init(cx);
         cx.bind_keys([
             KeyBinding::new("secondary-n", NewDocument, None),
             KeyBinding::new("secondary-o", OpenDocument, None),
@@ -2377,49 +2128,41 @@ fn main() {
             KeyBinding::new("secondary-shift-8", BulletsText, None),
             KeyBinding::new("secondary-shift-.", QuoteText, None),
             KeyBinding::new("secondary-k", LinkText, None),
-            KeyBinding::new("secondary-z", UndoText, None),
-            KeyBinding::new("secondary-shift-z", RedoText, None),
             KeyBinding::new("secondary-shift-p", TogglePreview, None),
             KeyBinding::new("secondary-comma", ToggleSettings, None),
             KeyBinding::new("secondary-shift-enter", PublishToNotion, None),
             KeyBinding::new("secondary-shift-t", PublishToTypecho, None),
             KeyBinding::new("secondary-q", QuitApplication, None),
-            KeyBinding::new("backspace", Backspace, Some("MarkdownInput")),
-            KeyBinding::new("delete", Delete, Some("MarkdownInput")),
-            KeyBinding::new("left", Left, Some("MarkdownInput")),
-            KeyBinding::new("right", Right, Some("MarkdownInput")),
-            KeyBinding::new("up", Up, Some("MarkdownInput")),
-            KeyBinding::new("down", Down, Some("MarkdownInput")),
-            KeyBinding::new("shift-left", SelectLeft, Some("MarkdownInput")),
-            KeyBinding::new("shift-right", SelectRight, Some("MarkdownInput")),
-            KeyBinding::new("shift-up", SelectUp, Some("MarkdownInput")),
-            KeyBinding::new("shift-down", SelectDown, Some("MarkdownInput")),
-            KeyBinding::new("secondary-a", SelectAll, Some("MarkdownInput")),
-            KeyBinding::new("secondary-v", PasteText, Some("MarkdownInput")),
-            KeyBinding::new("secondary-c", CopyText, Some("MarkdownInput")),
-            KeyBinding::new("secondary-x", CutText, Some("MarkdownInput")),
-            KeyBinding::new("home", Home, Some("MarkdownInput")),
-            KeyBinding::new("end", End, Some("MarkdownInput")),
         ]);
         let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
+        let mut editor_entity = None;
+        let mut editor_focus_handle = None;
         let window = cx
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(gpui::TitlebarOptions {
-                        title: Some("Open Live Writer · Markdown".into()),
+                        title: Some("Open Live Writer".into()),
                         ..Default::default()
                     }),
                     window_min_size: Some(size(px(900.), px(600.))),
                     ..Default::default()
                 },
-                |_, cx| cx.new(MarkdownEditor::new),
+                |window, cx| {
+                    let editor = cx.new(|cx| MarkdownEditor::new(window, cx));
+                    editor_focus_handle =
+                        Some(editor.read(cx).text_input.read(cx).focus_handle(cx));
+                    editor_entity = Some(editor.clone());
+                    cx.new(|cx| gpui_component::Root::new(editor, window, cx))
+                },
             )
             .expect("failed to open the editor window");
+        let editor_entity = editor_entity.expect("editor view was not created");
+        let editor_focus_handle = editor_focus_handle.expect("editor focus handle was not created");
         window
-            .update(cx, |editor, window, cx| {
-                window.focus(&editor.text_input.read(cx).focus_handle.clone());
-                let editor = cx.entity().downgrade();
+            .update(cx, |_, window, cx| {
+                window.focus(&editor_focus_handle);
+                let editor = editor_entity.downgrade();
                 window.on_window_should_close(cx, move |window, cx| {
                     let (dirty, close_confirmed) = editor
                         .read_with(cx, |editor, _| (editor.dirty, editor.close_confirmed))
@@ -2459,8 +2202,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        is_image_path, line_end, line_starts, markdown_image_url, normalize_newlines,
-        utf16_range_to_utf8,
+        EmbeddedAssets, is_image_path, line_end, line_starts, markdown_image_url,
+        normalize_newlines, utf16_range_to_utf8,
     };
 
     #[test]
@@ -2481,5 +2224,16 @@ mod tests {
         assert!(is_image_path(path));
         assert_eq!(markdown_image_url(path), "file:///tmp/封面.png");
         assert!(!is_image_path(Path::new("/tmp/article.md")));
+    }
+
+    #[test]
+    fn embeds_ribbon_icons() {
+        assert!(EmbeddedAssets::get("icons/new.png").is_some());
+        assert!(EmbeddedAssets::get("icons/open-draft.png").is_some());
+        assert!(EmbeddedAssets::get("icons/save-draft.png").is_some());
+        assert!(EmbeddedAssets::get("icons/divider.png").is_some());
+        assert!(EmbeddedAssets::get("icons/notion.png").is_some());
+        assert!(EmbeddedAssets::get("icons/typecho.png").is_some());
+        assert!(EmbeddedAssets::get("Writer.ico").is_some());
     }
 }
