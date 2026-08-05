@@ -1,3 +1,5 @@
+use markdown::{ParseOptions, mdast::Node, to_mdast};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Block {
     Heading {
@@ -10,8 +12,16 @@ pub enum Block {
         marker: String,
         text: String,
     },
+    Task {
+        checked: bool,
+        text: String,
+    },
     Quote(String),
-    Code(String),
+    Aside(String),
+    Code {
+        text: String,
+        language: Option<String>,
+    },
     Image {
         alt: String,
         url: String,
@@ -24,183 +34,336 @@ pub enum Block {
         rows: Vec<Vec<String>>,
     },
     Divider,
+    Html(String),
 }
 
+/// Parse CommonMark with the full GitHub Flavored Markdown extension set.
+///
+/// `markdown-rs` handles the grammar (including task lists, tables,
+/// strikethrough, autolinks, and footnotes); this adapter maps its AST to the
+/// native preview blocks used by the application.
 pub fn parse_blocks(markdown: &str) -> Vec<Block> {
-    let mut blocks = Vec::new();
-    let mut paragraph = Vec::new();
-    let mut code = None::<Vec<String>>;
-    let lines: Vec<&str> = markdown.lines().collect();
-    let mut index = 0;
-
-    let flush_paragraph = |blocks: &mut Vec<Block>, paragraph: &mut Vec<String>| {
-        if !paragraph.is_empty() {
-            blocks.push(Block::Paragraph(paragraph.join(" ")));
-            paragraph.clear();
-        }
+    let Ok(tree) = to_mdast(markdown, &ParseOptions::gfm()) else {
+        return vec![Block::Paragraph(markdown.to_owned())];
     };
 
-    while index < lines.len() {
-        let line = lines[index];
-        if let Some(code_lines) = code.as_mut() {
-            if line.trim_start().starts_with("```") {
-                blocks.push(Block::Code(std::mem::take(code_lines).join("\n")));
-                code = None;
-            } else {
-                code_lines.push(line.to_owned());
-            }
-            index += 1;
-            continue;
-        }
-
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            code = Some(Vec::new());
-        } else if let Some(headers) = table_row(trimmed)
-            && index + 1 < lines.len()
-            && is_table_separator(lines[index + 1])
-        {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            let width = headers.len();
-            let mut rows = Vec::new();
-            index += 2;
-            while index < lines.len() {
-                let Some(row) = table_row(lines[index].trim()) else {
-                    break;
-                };
-                rows.push(normalize_row(row, width));
-                index += 1;
-            }
-            blocks.push(Block::Table {
-                headers: normalize_row(headers, width),
-                rows,
-            });
-            continue;
-        } else if let Some((alt, url)) = image(trimmed) {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(Block::Image { alt, url });
-        } else if let Some(url) = video(trimmed) {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(Block::Video { url });
-        } else if trimmed.is_empty() {
-            flush_paragraph(&mut blocks, &mut paragraph);
-        } else if trimmed == "---" || trimmed == "***" {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(Block::Divider);
-        } else if let Some((level, text)) = heading(trimmed) {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(Block::Heading { level, text });
-        } else if let Some(text) = trimmed
-            .strip_prefix("> ")
-            .or_else(|| trimmed.strip_prefix(">"))
-        {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(Block::Quote(text.trim().to_owned()));
-        } else if let Some(text) = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-        {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(Block::Bullet(text.to_owned()));
-        } else if let Some((marker, text)) = trimmed.split_once(". ").filter(|(prefix, _)| {
-            !prefix.is_empty() && prefix.chars().all(|character| character.is_ascii_digit())
-        }) {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(Block::Numbered {
-                marker: marker.to_owned(),
-                text: text.to_owned(),
-            });
-        } else {
-            paragraph.push(trimmed.to_owned());
-        }
-        index += 1;
-    }
-
-    if let Some(code_lines) = code {
-        blocks.push(Block::Code(code_lines.join("\n")));
-    }
-    flush_paragraph(&mut blocks, &mut paragraph);
+    let mut blocks = Vec::new();
+    append_node(&tree, &mut blocks);
     blocks
 }
 
-pub fn strip_inline(markdown: &str) -> String {
-    let mut text = markdown.to_owned();
-    while let Some(start) = text.find('[') {
-        let Some(end) = text[start..].find("](").map(|offset| start + offset) else {
-            break;
+fn append_node(node: &Node, blocks: &mut Vec<Block>) {
+    match node {
+        Node::Root(root) => append_nodes(&root.children, blocks),
+        Node::Heading(heading) => blocks.push(Block::Heading {
+            level: heading.depth,
+            text: inline_markdown(&heading.children),
+        }),
+        Node::Paragraph(paragraph) => append_paragraph(&paragraph.children, blocks),
+        Node::List(list) => append_list(list, blocks),
+        Node::Blockquote(quote) => {
+            let text = block_text(&quote.children);
+            if !text.trim().is_empty() {
+                blocks.push(Block::Quote(text));
+            }
+        }
+        Node::Code(code) => blocks.push(Block::Code {
+            text: code.value.clone(),
+            language: code.lang.clone(),
+        }),
+        Node::ThematicBreak(_) => blocks.push(Block::Divider),
+        Node::Table(table) => append_table(table, blocks),
+        Node::Html(html) => append_html(&html.value, blocks),
+        Node::Image(image) => blocks.push(Block::Image {
+            alt: image.alt.clone(),
+            url: image.url.clone(),
+        }),
+        _ => {
+            let text = inline_markdown(std::slice::from_ref(node));
+            if !text.trim().is_empty() {
+                blocks.push(Block::Paragraph(text));
+            }
+        }
+    }
+}
+
+fn append_nodes(nodes: &[Node], blocks: &mut Vec<Block>) {
+    for node in nodes {
+        append_node(node, blocks);
+    }
+}
+
+fn append_paragraph(children: &[Node], blocks: &mut Vec<Block>) {
+    if let [Node::Image(image)] = children {
+        blocks.push(Block::Image {
+            alt: image.alt.clone(),
+            url: image.url.clone(),
+        });
+        return;
+    }
+
+    if let [Node::Link(link)] = children
+        && is_video_label(&inline_markdown(&link.children))
+    {
+        blocks.push(Block::Video {
+            url: link.url.clone(),
+        });
+        return;
+    }
+
+    if let [Node::Html(html)] = children
+        && let Some(content) = aside_content(&html.value)
+    {
+        blocks.push(Block::Aside(content));
+        return;
+    }
+
+    let text = inline_markdown(children);
+    if !text.trim().is_empty() {
+        blocks.push(Block::Paragraph(text));
+    }
+}
+
+fn append_list(list: &markdown::mdast::List, blocks: &mut Vec<Block>) {
+    for (offset, node) in list.children.iter().enumerate() {
+        let Node::ListItem(item) = node else {
+            continue;
         };
-        let Some(close) = text[end + 2..].find(')').map(|offset| end + 2 + offset) else {
-            break;
-        };
-        let label = text[start + 1..end].to_owned();
-        let replace_start = if start > 0 && text.as_bytes()[start - 1] == b'!' {
-            start - 1
-        } else {
-            start
-        };
-        text.replace_range(replace_start..=close, &label);
+
+        let text = list_item_text(&item.children);
+        if !text.trim().is_empty() {
+            if let Some(checked) = item.checked {
+                blocks.push(Block::Task { checked, text });
+            } else if list.ordered {
+                let marker = list.start.unwrap_or(1) + offset as u32;
+                blocks.push(Block::Numbered {
+                    marker: marker.to_string(),
+                    text,
+                });
+            } else {
+                blocks.push(Block::Bullet(text));
+            }
+        }
+
+        for child in &item.children {
+            if matches!(child, Node::List(_)) {
+                append_node(child, blocks);
+            }
+        }
     }
-    for marker in ["**", "__", "~~", "*", "_", "`"] {
-        text = text.replace(marker, "");
-    }
-    text
 }
 
-fn image(line: &str) -> Option<(String, String)> {
-    let rest = line.strip_prefix("![")?;
-    let label_end = rest.find("](")?;
-    let url = rest[label_end + 2..].strip_suffix(')')?.trim();
-    (!url.is_empty()).then(|| (rest[..label_end].to_owned(), url.to_owned()))
+fn list_item_text(children: &[Node]) -> String {
+    children
+        .iter()
+        .filter_map(|child| match child {
+            Node::Paragraph(paragraph) => Some(inline_markdown(&paragraph.children)),
+            Node::Code(code) => Some(format!("`{}`", code.value)),
+            _ => None,
+        })
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-fn video(line: &str) -> Option<String> {
-    let rest = line.strip_prefix('[')?;
-    let label_end = rest.find("](")?;
-    let label = rest[..label_end].trim();
-    if !label.eq_ignore_ascii_case("视频") && !label.eq_ignore_ascii_case("video") {
-        return None;
-    }
-    let url = rest[label_end + 2..].strip_suffix(')')?.trim();
-    (!url.is_empty()).then(|| url.to_owned())
-}
+fn append_table(table: &markdown::mdast::Table, blocks: &mut Vec<Block>) {
+    let mut rows = table.children.iter().filter_map(|node| match node {
+        Node::TableRow(row) => Some(
+            row.children
+                .iter()
+                .filter_map(|cell| match cell {
+                    Node::TableCell(cell) => Some(inline_markdown(&cell.children)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    });
 
-fn table_row(line: &str) -> Option<Vec<String>> {
-    if !line.contains('|') {
-        return None;
-    }
-    let line = line.strip_prefix('|').unwrap_or(line);
-    let line = line.strip_suffix('|').unwrap_or(line);
-    let cells: Vec<String> = line.split('|').map(|cell| cell.trim().to_owned()).collect();
-    (!cells.is_empty() && cells.iter().any(|cell| !cell.is_empty())).then_some(cells)
-}
-
-fn is_table_separator(line: &str) -> bool {
-    let Some(cells) = table_row(line.trim()) else {
-        return false;
+    let Some(headers) = rows.next() else {
+        return;
     };
-    cells.iter().all(|cell| {
-        let cell = cell.trim_matches(':').trim();
-        cell.len() >= 3 && cell.chars().all(|character| character == '-')
-    })
+    blocks.push(Block::Table {
+        headers,
+        rows: rows.collect(),
+    });
 }
 
-fn normalize_row(mut row: Vec<String>, width: usize) -> Vec<String> {
-    row.truncate(width);
-    row.resize(width, String::new());
-    row
-}
-
-fn heading(line: &str) -> Option<(u8, String)> {
-    let marker_len = line
-        .chars()
-        .take_while(|character| *character == '#')
-        .count();
-    if (1..=6).contains(&marker_len) && line.chars().nth(marker_len) == Some(' ') {
-        Some((marker_len as u8, line[marker_len + 1..].trim().to_owned()))
-    } else {
-        None
+fn append_html(value: &str, blocks: &mut Vec<Block>) {
+    if let Some(content) = aside_content(value) {
+        blocks.push(Block::Aside(content));
+    } else if !value.trim().is_empty() {
+        // Raw HTML is intentionally shown as source instead of being executed.
+        blocks.push(Block::Html(value.trim().to_owned()));
     }
+}
+
+fn aside_content(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let lowercase = trimmed.to_ascii_lowercase();
+    if !lowercase.starts_with("<aside") {
+        return None;
+    }
+
+    let opening_end = trimmed.find('>')?;
+    let closing_start = lowercase.rfind("</aside>")?;
+    (closing_start >= opening_end)
+        .then(|| trimmed[opening_end + 1..closing_start].trim().to_owned())
+}
+
+fn is_video_label(label: &str) -> bool {
+    let label = label.trim();
+    label.eq_ignore_ascii_case("video") || label == "视频"
+}
+
+fn block_text(nodes: &[Node]) -> String {
+    nodes
+        .iter()
+        .filter_map(|node| match node {
+            Node::Paragraph(paragraph) => Some(inline_markdown(&paragraph.children)),
+            Node::Code(code) => Some(format!("`{}`", code.value)),
+            Node::List(list) => Some(
+                list.children
+                    .iter()
+                    .filter_map(|node| match node {
+                        Node::ListItem(item) => Some(list_item_text(&item.children)),
+                        _ => None,
+                    })
+                    .filter(|text| !text.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        })
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn inline_markdown(nodes: &[Node]) -> String {
+    nodes.iter().map(inline_markdown_node).collect::<String>()
+}
+
+fn inline_markdown_node(node: &Node) -> String {
+    match node {
+        Node::Text(text) => text.value.clone(),
+        Node::Strong(strong) => format!("**{}**", inline_markdown(&strong.children)),
+        Node::Emphasis(emphasis) => format!("*{}*", inline_markdown(&emphasis.children)),
+        Node::Delete(delete) => format!("~~{}~~", inline_markdown(&delete.children)),
+        Node::InlineCode(code) => format!("`{}`", code.value),
+        Node::InlineMath(math) => format!("${}$", math.value),
+        Node::Link(link) => format!("[{}]({})", inline_markdown(&link.children), link.url),
+        Node::Image(image) => format!("![{}]({})", image.alt, image.url),
+        Node::Break(_) => "\n".to_owned(),
+        Node::Html(html) => html.value.clone(),
+        Node::Paragraph(paragraph) => inline_markdown(&paragraph.children),
+        _ => String::new(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InlineStyle {
+    Bold,
+    Italic,
+    Strike,
+    Code,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RichTextPiece {
+    pub text: String,
+    pub styles: Vec<InlineStyle>,
+    pub link: Option<String>,
+    pub image: Option<String>,
+}
+
+/// Parse inline Markdown (paragraph / heading / list item text) into annotated
+/// text pieces. Both the live preview and the publishing export use this one
+/// renderer, so the two views stay consistent.
+pub fn parse_inline(markdown: &str) -> Vec<RichTextPiece> {
+    let Ok(tree) = to_mdast(markdown, &ParseOptions::gfm()) else {
+        return vec![RichTextPiece {
+            text: markdown.to_owned(),
+            styles: Vec::new(),
+            link: None,
+            image: None,
+        }];
+    };
+    let children = match &tree {
+        Node::Root(root) => root.children.as_slice(),
+        _ => std::slice::from_ref(&tree),
+    };
+    let mut pieces = Vec::new();
+    append_inline(children, &mut pieces, &[], None);
+    pieces
+}
+
+fn append_inline(
+    nodes: &[Node],
+    pieces: &mut Vec<RichTextPiece>,
+    styles: &[InlineStyle],
+    link: Option<&str>,
+) {
+    for node in nodes {
+        match node {
+            Node::Text(text) => push_inline_piece(pieces, text.value.clone(), styles, link, None),
+            Node::Strong(strong) => {
+                let mut nested = styles.to_vec();
+                nested.push(InlineStyle::Bold);
+                append_inline(&strong.children, pieces, &nested, link);
+            }
+            Node::Emphasis(emphasis) => {
+                let mut nested = styles.to_vec();
+                nested.push(InlineStyle::Italic);
+                append_inline(&emphasis.children, pieces, &nested, link);
+            }
+            Node::Delete(delete) => {
+                let mut nested = styles.to_vec();
+                nested.push(InlineStyle::Strike);
+                append_inline(&delete.children, pieces, &nested, link);
+            }
+            Node::InlineCode(code) => {
+                let mut nested = styles.to_vec();
+                nested.push(InlineStyle::Code);
+                push_inline_piece(pieces, code.value.clone(), &nested, link, None);
+            }
+            Node::Link(link_node) => {
+                append_inline(&link_node.children, pieces, styles, Some(&link_node.url));
+            }
+            Node::Image(image) => {
+                push_inline_piece(pieces, image.alt.clone(), styles, link, Some(&image.url));
+            }
+            Node::Break(_) => push_inline_piece(pieces, "\n".to_owned(), styles, link, None),
+            Node::Html(html) => push_inline_piece(pieces, html.value.clone(), styles, link, None),
+            Node::Paragraph(paragraph) => append_inline(&paragraph.children, pieces, styles, link),
+            _ => {}
+        }
+    }
+}
+
+fn push_inline_piece(
+    pieces: &mut Vec<RichTextPiece>,
+    text: String,
+    styles: &[InlineStyle],
+    link: Option<&str>,
+    image: Option<&str>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    pieces.push(RichTextPiece {
+        text,
+        styles: styles.to_vec(),
+        link: link.map(ToOwned::to_owned),
+        image: image.map(ToOwned::to_owned),
+    });
+}
+
+pub fn strip_inline(markdown: &str) -> String {
+    parse_inline(markdown)
+        .into_iter()
+        .map(|piece| piece.text)
+        .collect()
 }
 
 #[cfg(test)]
@@ -210,7 +373,7 @@ mod tests {
     #[test]
     fn parses_the_blocks_used_by_the_preview() {
         assert_eq!(
-            parse_blocks("# 标题\n\n- 一\n1. 二\n> 三\n\n```\nlet x = 1;\n```"),
+            parse_blocks("# 标题\n\n- 一\n\n1. 二\n\n> 三\n\n```\nlet x = 1;\n```"),
             vec![
                 Block::Heading {
                     level: 1,
@@ -222,7 +385,31 @@ mod tests {
                     text: "二".into(),
                 },
                 Block::Quote("三".into()),
-                Block::Code("let x = 1;".into()),
+                Block::Code {
+                    text: "let x = 1;".into(),
+                    language: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_gfm_tasks_and_notion_asides() {
+        assert_eq!(
+            parse_blocks(
+                "- [ ] 待完成\n- [x] 已完成\n\n<aside>💡 **提示**</aside>\n\n<aside></aside>"
+            ),
+            vec![
+                Block::Task {
+                    checked: false,
+                    text: "待完成".into(),
+                },
+                Block::Task {
+                    checked: true,
+                    text: "已完成".into(),
+                },
+                Block::Aside("💡 **提示**".into()),
+                Block::Aside(String::new()),
             ]
         );
     }
@@ -251,6 +438,32 @@ mod tests {
                 url: "https://example.com/video".into(),
             }]
         );
+    }
+
+    #[test]
+    fn parses_inline_styles_links_and_images() {
+        use super::{InlineStyle, parse_inline};
+
+        let pieces =
+            parse_inline("**粗体** *斜体* `代码` [链接](https://example.com) ![图](a.png)");
+        assert_eq!(pieces[0].text, "粗体");
+        assert_eq!(pieces[0].styles, vec![InlineStyle::Bold]);
+        assert_eq!(pieces[2].styles, vec![InlineStyle::Italic]);
+        assert_eq!(pieces[4].styles, vec![InlineStyle::Code]);
+        assert_eq!(pieces[6].link.as_deref(), Some("https://example.com"));
+        assert_eq!(pieces[8].text, "图");
+        assert_eq!(pieces[8].image.as_deref(), Some("a.png"));
+
+        // Nested link inside bold keeps both annotations.
+        let pieces = parse_inline("**[链接](https://x)**");
+        assert_eq!(pieces[0].styles, vec![InlineStyle::Bold]);
+        assert_eq!(pieces[0].link.as_deref(), Some("https://x"));
+
+        // GFM does not treat intraword underscores as emphasis.
+        let pieces = parse_inline("snake_case");
+        assert_eq!(pieces.len(), 1);
+        assert!(pieces[0].styles.is_empty());
+        assert_eq!(pieces[0].text, "snake_case");
     }
 
     #[test]

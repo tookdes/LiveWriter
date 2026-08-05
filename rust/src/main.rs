@@ -1,54 +1,70 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod markdown;
 mod publishing;
 mod storage;
 
 use std::{
     borrow::Cow,
+    collections::HashMap,
     fs,
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use gpui::{
     AnyElement, App, Application, AssetSource, Bounds, ClipboardItem, Context, CursorStyle, Entity,
-    EntityInputHandler, FocusHandle, Focusable, FontWeight, Image, ImageFormat, Img, KeyBinding,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
-    PromptLevel, SharedString, Window, WindowBounds, WindowOptions, actions, div, hsla, img,
-    linear_color_stop, linear_gradient, prelude::*, px, relative, rgb, size, white,
+    EntityInputHandler, FocusHandle, Focusable, FontWeight, Image, ImageFormat, ImageSource, Img,
+    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
+    Pixels, PromptLevel, SharedString, Window, WindowBounds, WindowOptions, actions, div, hsla,
+    img, linear_color_stop, linear_gradient, prelude::*, px, relative, rgb, size, white,
 };
 use gpui_component::{
-    RopeExt,
+    RopeExt, Theme, ThemeMode,
     input::{Input, InputEvent, InputState},
 };
 use rust_embed::Embed;
 
-use crate::markdown::{Block, parse_blocks};
+use crate::markdown::{Block, InlineStyle, RichTextPiece, parse_blocks, parse_inline};
 use crate::publishing::{
     CREDENTIALS_URL, CREDENTIALS_USERNAME, NotionConfig, StoredPublishSettings, TypechoConfig,
-    document_title, publish_to_notion as publish_notion_request,
+    document_title, local_image_count, publish_to_notion as publish_notion_request,
     publish_to_typecho as publish_typecho_request,
 };
 
-const DEFAULT_MARKDOWN: &str = "# 欢迎回来，Open Live Writer\n\n这是一个保持怀旧外观的 Markdown 编辑器。你可以直接编辑左侧内容，然后切换到预览。\n\n- 使用工具栏快速插入 Markdown\n- 点击“复制到 Notion”复制可粘贴的 Markdown\n- 文件使用 UTF-8 的 md 格式保存\n\n> 先写作，再发布。\n";
+const DEFAULT_MARKDOWN: &str = "# 欢迎回来，Open Live Writer\n\n这是一个保持怀旧外观的 Markdown 编辑器。你可以直接编辑左侧内容，然后切换到预览。\n\n- 使用工具栏快速插入 Markdown\n- 点击“复制到 Notion”复制可粘贴的 Markdown\n- 文件使用 UTF-8 的 md 格式保存\n- [ ] GitHub 待办清单\n- [x] 已完成的待办\n\n<aside>💡 Notion 旁注块</aside>\n\n> 先写作，再发布。\n";
 
 const BLUE: u32 = 0x3b78b4;
 const DARK_BLUE: u32 = 0x2b5f95;
-const RIBBON_BLUE: u32 = 0xe6eff9;
+const RIBBON_BLUE: u32 = 0xf3f6fa;
 const RIBBON_SEPARATOR: u32 = 0xc8d5e2;
 const RIBBON_TAB_HEIGHT: Pixels = px(30.);
-const RIBBON_HEIGHT: Pixels = px(84.);
-const RIBBON_BUTTON_WIDTH: Pixels = px(56.);
-const RIBBON_BUTTON_HEIGHT: Pixels = px(56.);
+const RIBBON_HEIGHT: Pixels = px(94.);
+const RIBBON_LARGE_BUTTON_WIDTH: Pixels = px(62.);
+const RIBBON_LARGE_BUTTON_HEIGHT: Pixels = px(70.);
+const RIBBON_SMALL_BUTTON_HEIGHT: Pixels = px(22.);
 const WORKSPACE: u32 = 0xe9edf2;
 const BORDER: u32 = 0xc6ced8;
 const TEXT: u32 = 0x263746;
 const MUTED: u32 = 0x617285;
 const INLINE_CODE_MARKER: &str = "\x60";
 
+fn typecho_is_primary_publish_target(notion_configured: bool, typecho_configured: bool) -> bool {
+    typecho_configured && !notion_configured
+}
+
 macro_rules! ribbon_controls {
     ($first:expr $(, $rest:expr)* $(,)?) => {{
-        let controls = div().flex().items_center().child($first);
+        let controls = div().h_full().flex().items_center().gap_0p5().child($first);
+        $(let controls = controls.child($rest);)*
+        controls
+    }};
+}
+
+macro_rules! ribbon_stack {
+    ($first:expr $(, $rest:expr)* $(,)?) => {{
+        let controls = div().flex().flex_col().justify_center().gap_0p5().child($first);
         $(let controls = controls.child($rest);)*
         controls
     }};
@@ -104,11 +120,10 @@ struct MarkdownInput {
     state: Entity<InputState>,
     pub content: SharedString,
     multi_line: bool,
+    masked: bool,
     pending_content: Option<SharedString>,
     pending_insert: Option<SharedString>,
-    suppress_history: bool,
-    undo_stack: Vec<SharedString>,
-    redo_stack: Vec<SharedString>,
+    refocus_on_recreate: bool,
     _subscription: gpui::Subscription,
 }
 
@@ -124,39 +139,26 @@ impl MarkdownInput {
         let state = cx.new(|cx| {
             let mut state = InputState::new(window, cx).default_value(content.clone());
             if multi_line {
-                state = state.multi_line().soft_wrap(false);
+                state = state.multi_line().soft_wrap(true);
             }
             state.masked(masked)
         });
-        let subscription = cx.subscribe(
-            &state,
-            |input: &mut MarkdownInput, state, event: &InputEvent, cx| {
-                if !matches!(event, InputEvent::Change) {
-                    return;
-                }
-                let next = state.read(cx).value();
-                if next == input.content {
-                    return;
-                }
-                if !input.suppress_history {
-                    input.undo_stack.push(input.content.clone());
-                    input.redo_stack.clear();
-                }
-                input.content = next;
-                cx.notify();
-            },
-        );
+        let subscription = subscribe_input_state(&state, cx);
         Self {
             state: state.clone(),
             content,
             multi_line,
+            masked,
             pending_content: None,
             pending_insert: None,
-            suppress_history: false,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
+            refocus_on_recreate: false,
             _subscription: subscription,
         }
+    }
+
+    fn set_document_content(&mut self, content: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.refocus_on_recreate = true;
+        self.set_content(content, cx);
     }
 
     fn set_content(&mut self, content: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -164,17 +166,6 @@ impl MarkdownInput {
         self.content = content.clone();
         self.pending_content = Some(content);
         self.pending_insert = None;
-        self.suppress_history = true;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        cx.notify();
-    }
-
-    fn restore_content(&mut self, content: SharedString, cx: &mut Context<Self>) {
-        self.content = content.clone();
-        self.pending_content = Some(content);
-        self.pending_insert = None;
-        self.suppress_history = true;
         cx.notify();
     }
 
@@ -192,9 +183,28 @@ impl MarkdownInput {
 
     fn sync_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(content) = self.pending_content.take() {
-            let state = self.state.clone();
-            state.update(cx, |state, cx| state.set_value(content, window, cx));
-            self.suppress_history = false;
+            // Recreate the InputState so the native undo/redo history cannot
+            // leak between documents (a fresh state always starts with an
+            // empty history).
+            let multi_line = self.multi_line;
+            let masked = self.masked;
+            let refocus = self.refocus_on_recreate;
+            let state = cx.new(|cx| {
+                let mut state = InputState::new(window, cx).default_value(content.clone());
+                if multi_line {
+                    state = state.multi_line().soft_wrap(true);
+                }
+                state.masked(masked)
+            });
+            self._subscription = subscribe_input_state(&state, cx);
+            self.state = state;
+            self.refocus_on_recreate = false;
+            if refocus {
+                let handle = self.state.read(cx).focus_handle(cx);
+                window.on_next_frame(move |window, _| {
+                    window.focus(&handle);
+                });
+            }
         }
         if let Some(text) = self.pending_insert.take() {
             let state = self.state.clone();
@@ -218,37 +228,49 @@ impl MarkdownInput {
             };
             let range = state.text().offset_utf16_to_offset(selection.range.start)
                 ..state.text().offset_utf16_to_offset(selection.range.end);
+            let cursor_inside = range.start + prefix.len();
+            let move_cursor_inside = range.is_empty();
             let selected = state.text().slice(range).to_string();
             state.replace(format!("{}{}{}", prefix, selected, suffix), window, cx);
+            if move_cursor_inside {
+                let position = state.text().offset_to_position(cursor_inside);
+                state.set_cursor_position(position, window, cx);
+            }
         });
     }
 
-    fn prefix_current_line(&mut self, prefix: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_line_prefix(&mut self, prefix: &str, window: &mut Window, cx: &mut Context<Self>) {
         let prefix = prefix.to_owned();
         let state = self.state.clone();
         state.update(cx, |state, cx| {
-            let position = state.text().offset_to_position(state.cursor());
-            let line_start = state.text().line_start_offset(position.line as usize);
-            let line_start = state.text().offset_to_position(line_start);
-            state.set_cursor_position(line_start, window, cx);
-            state.insert(prefix, window, cx);
+            let full = state.text().to_string();
+            let starts = line_starts(&full);
+            let line = state.text().offset_to_position(state.cursor()).line as usize;
+            let line = line.min(starts.len().saturating_sub(1));
+            let line_start = starts[line];
+            let line_end = line_end(&starts, line, full.len());
+            let line_text = &full[line_start..line_end];
+
+            let (new_line, cursor_delta) = if prefix == "# " {
+                toggle_heading_line(line_text)
+            } else if let Some(rest) = line_text.strip_prefix(&prefix) {
+                (rest.to_owned(), 0)
+            } else {
+                (format!("{prefix}{line_text}"), prefix.len())
+            };
+
+            let range_utf16 = utf16_range_from_utf8(&full, line_start..line_end);
+            <InputState as EntityInputHandler>::replace_text_in_range(
+                state,
+                Some(range_utf16),
+                &new_line,
+                window,
+                cx,
+            );
+            let new_cursor = (line_start + cursor_delta).min(state.text().len());
+            let position = state.text().offset_to_position(new_cursor);
+            state.set_cursor_position(position, window, cx);
         });
-    }
-
-    fn undo(&mut self, cx: &mut Context<Self>) {
-        let Some(previous) = self.undo_stack.pop() else {
-            return;
-        };
-        self.redo_stack.push(self.content.clone());
-        self.restore_content(previous, cx);
-    }
-
-    fn redo(&mut self, cx: &mut Context<Self>) {
-        let Some(next) = self.redo_stack.pop() else {
-            return;
-        };
-        self.undo_stack.push(self.content.clone());
-        self.restore_content(next, cx);
     }
 }
 
@@ -268,6 +290,37 @@ impl Render for MarkdownInput {
             .w_full()
             .when(self.multi_line, |this| this.h_full())
             .child(input)
+    }
+}
+
+fn subscribe_input_state(
+    state: &Entity<InputState>,
+    cx: &mut Context<MarkdownInput>,
+) -> gpui::Subscription {
+    cx.subscribe(
+        state,
+        |input: &mut MarkdownInput, state, event: &InputEvent, cx| {
+            if !matches!(event, InputEvent::Change) {
+                return;
+            }
+            let next = state.read(cx).value();
+            if next == input.content {
+                return;
+            }
+            input.content = next;
+            cx.notify();
+        },
+    )
+}
+
+fn toggle_heading_line(line: &str) -> (String, usize) {
+    if line.starts_with("# ") {
+        (line.trim_start_matches('#').trim_start().to_owned(), 0)
+    } else if line.starts_with('#') {
+        let rest = line.trim_start_matches('#').trim_start();
+        (format!("# {rest}"), 2)
+    } else {
+        (format!("# {line}"), 2)
     }
 }
 
@@ -296,6 +349,9 @@ struct MarkdownEditor {
     last_observed_content: String,
     suppress_observer: bool,
     close_confirmed: bool,
+    line_ending: String,
+    utf8_bom: bool,
+    last_window_title: String,
     _content_subscription: gpui::Subscription,
 }
 
@@ -378,6 +434,9 @@ impl MarkdownEditor {
             last_observed_content: initial,
             suppress_observer: false,
             close_confirmed: false,
+            line_ending: "\n".to_owned(),
+            utf8_bom: false,
+            last_window_title: "Open Live Writer".to_owned(),
             publish_settings,
             _content_subscription: subscription,
         };
@@ -387,6 +446,20 @@ impl MarkdownEditor {
                 && let Ok(settings) = serde_json::from_slice::<StoredPublishSettings>(&bytes)
             {
                 let _ = view.update(cx, |editor, cx| editor.load_publish_settings(settings, cx));
+            }
+        })
+        .detach();
+        cx.spawn(async move |editor, cx| {
+            loop {
+                gpui::Timer::after(std::time::Duration::from_secs(30)).await;
+                let _ = editor.update(cx, |editor, cx| {
+                    if editor.dirty {
+                        let content = editor.content(cx);
+                        if let Err(error) = storage::save_autosave(&content) {
+                            eprintln!("自动备份失败：{error}");
+                        }
+                    }
+                });
             }
         })
         .detach();
@@ -421,6 +494,8 @@ impl MarkdownEditor {
         self.settings_visible = !self.settings_visible;
         self.status = if self.settings_visible {
             "发布设置 · 凭据使用系统安全存储".into()
+        } else if self.dirty {
+            "正在编辑 · 尚未保存".into()
         } else {
             "就绪 · Markdown 模式".into()
         };
@@ -467,15 +542,27 @@ impl MarkdownEditor {
     }
 
     fn replace_document(&mut self, path: Option<PathBuf>, content: String, cx: &mut Context<Self>) {
+        let (content, line_ending, utf8_bom) = prepare_content(content);
         self.suppress_observer = true;
-        self.text_input
-            .update(cx, |input, cx| input.set_content(content.clone(), cx));
+        self.text_input.update(cx, |input, cx| {
+            input.set_document_content(content.clone(), cx)
+        });
         self.suppress_observer = false;
         self.last_observed_content = content;
+        self.line_ending = line_ending;
+        self.utf8_bom = utf8_bom;
         self.path = path;
         self.dirty = false;
         self.close_confirmed = false;
-        self.status = "已加载 · UTF-8 Markdown".into();
+        self.status = "已加载 · Markdown".into();
+        let _ = storage::clear_autosave();
+        cx.notify();
+    }
+
+    fn restore_autosave(&mut self, content: String, cx: &mut Context<Self>) {
+        self.replace_document(None, content, cx);
+        self.dirty = true;
+        self.status = "已恢复自动备份 · 尚未保存".into();
         cx.notify();
     }
 
@@ -529,7 +616,7 @@ impl MarkdownEditor {
     fn open_draft_now(&mut self, cx: &mut Context<Self>) {
         match storage::load_draft() {
             Ok(Some((path, content))) => {
-                self.replace_document(None, normalize_newlines(content), cx);
+                self.replace_document(None, content, cx);
                 self.status = format!("已打开草稿 · {}", display_path(&path)).into();
             }
             Ok(None) => self.status = "暂无本地草稿".into(),
@@ -556,21 +643,47 @@ impl MarkdownEditor {
         let answer = window.prompt(
             PromptLevel::Warning,
             "当前文章有未保存的修改",
-            Some("请选择“放弃修改并继续”，或先保存后取消。"),
-            &["放弃修改并继续", "取消"],
+            Some("请选择保存并继续、放弃修改并继续，或取消。"),
+            &["保存并继续", "放弃修改并继续", "取消"],
             cx,
         );
-        cx.spawn(async move |editor, cx| {
-            if answer.await.ok() != Some(0) {
-                return;
+        let current_path = self.path.clone();
+        cx.spawn(async move |editor, cx| match answer.await.ok() {
+            Some(0) => {
+                if let Some(path) = current_path {
+                    let _ = editor.update(cx, |editor, cx| {
+                        editor.save_to(path, cx);
+                        editor.continue_pending(operation, cx);
+                    });
+                    return;
+                }
+                let Ok(receiver) = cx.update(|app| {
+                    app.prompt_for_new_path(&default_save_directory(), Some("未命名文章.md"))
+                }) else {
+                    return;
+                };
+                let Ok(Ok(Some(path))) = receiver.await else {
+                    return;
+                };
+                let _ = editor.update(cx, |editor, cx| {
+                    editor.save_to(path, cx);
+                    editor.continue_pending(operation, cx);
+                });
             }
-            let _ = editor.update(cx, |editor, cx| match operation {
-                PendingOperation::New => editor.new_document_now(cx),
-                PendingOperation::Open => editor.begin_open(cx),
-                PendingOperation::OpenDraft => editor.open_draft_now(cx),
-            });
+            Some(1) => {
+                let _ = editor.update(cx, |editor, cx| editor.continue_pending(operation, cx));
+            }
+            _ => {}
         })
         .detach();
+    }
+
+    fn continue_pending(&mut self, operation: PendingOperation, cx: &mut Context<Self>) {
+        match operation {
+            PendingOperation::New => self.new_document_now(cx),
+            PendingOperation::Open => self.begin_open(cx),
+            PendingOperation::OpenDraft => self.open_draft_now(cx),
+        }
     }
 
     fn open_document(&mut self, _: &OpenDocument, window: &mut Window, cx: &mut Context<Self>) {
@@ -595,12 +708,20 @@ impl MarkdownEditor {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            match fs::read_to_string(&path) {
-                Ok(content) => {
-                    let _ = editor.update(cx, |editor, cx| {
-                        editor.replace_document(Some(path), normalize_newlines(content), cx);
-                    });
-                }
+            match fs::read(&path) {
+                Ok(bytes) => match decode_markdown(&bytes) {
+                    Ok(content) => {
+                        let _ = editor.update(cx, |editor, cx| {
+                            editor.replace_document(Some(path), content, cx);
+                        });
+                    }
+                    Err(message) => {
+                        let _ = editor.update(cx, |editor, cx| {
+                            editor.status = message.into();
+                            cx.notify();
+                        });
+                    }
+                },
                 Err(error) => {
                     let _ = editor.update(cx, |editor, cx| {
                         editor.status = format!("打开失败：{error}").into();
@@ -622,13 +743,17 @@ impl MarkdownEditor {
     }
 
     fn save_to(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let content = self.content(cx);
+        let mut content = self.content(cx).replace('\n', &self.line_ending);
+        if self.utf8_bom {
+            content.insert(0, '\u{feff}');
+        }
         match fs::write(&path, content) {
             Ok(()) => {
                 self.path = Some(path.clone());
                 self.dirty = false;
                 self.last_observed_content = self.content(cx);
                 self.status = format!("已保存 · {}", display_path(&path)).into();
+                let _ = storage::clear_autosave();
             }
             Err(error) => self.status = format!("保存失败：{error}").into(),
         }
@@ -640,8 +765,7 @@ impl MarkdownEditor {
             self.save_to(path, cx);
             return;
         }
-        let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let receiver = cx.prompt_for_new_path(&directory, Some("未命名文章.md"));
+        let receiver = cx.prompt_for_new_path(&default_save_directory(), Some("未命名文章.md"));
         cx.spawn(async move |editor, cx| {
             let Ok(Ok(Some(path))) = receiver.await else {
                 return;
@@ -692,18 +816,45 @@ impl MarkdownEditor {
         let answer = window.prompt(
             PromptLevel::Warning,
             "当前文章有未保存的修改",
-            Some("退出后这些修改将丢失。"),
-            &["放弃并退出", "取消"],
+            Some("请选择保存并退出、放弃修改并退出，或取消。"),
+            &["保存并退出", "放弃并退出", "取消"],
             cx,
         );
-        cx.spawn(async move |editor, cx| {
-            if answer.await.ok() == Some(0) {
+        let current_path = self.path.clone();
+        cx.spawn(async move |editor, cx| match answer.await.ok() {
+            Some(0) => {
+                if let Some(path) = current_path {
+                    let _ = editor.update(cx, |editor, cx| {
+                        editor.save_to(path, cx);
+                        editor.close_confirmed = true;
+                        cx.notify();
+                    });
+                    let _ = cx.update(|app| app.quit());
+                    return;
+                }
+                let Ok(receiver) = cx.update(|app| {
+                    app.prompt_for_new_path(&default_save_directory(), Some("未命名文章.md"))
+                }) else {
+                    return;
+                };
+                let Ok(Ok(Some(path))) = receiver.await else {
+                    return;
+                };
+                let _ = editor.update(cx, |editor, cx| {
+                    editor.save_to(path, cx);
+                    editor.close_confirmed = true;
+                    cx.notify();
+                });
+                let _ = cx.update(|app| app.quit());
+            }
+            Some(1) => {
                 let _ = editor.update(cx, |editor, cx| {
                     editor.close_confirmed = true;
                     cx.notify();
                 });
                 let _ = cx.update(|app| app.quit());
             }
+            _ => {}
         })
         .detach();
     }
@@ -716,17 +867,18 @@ impl MarkdownEditor {
     ) {
         let markdown = self.content(cx);
         let title = document_title(&markdown);
+        let warning = local_image_warning(&markdown);
         if let Some(config) =
             NotionConfig::from_env().or_else(|| self.publish_settings.notion_config())
         {
             let http = cx.http_client();
-            self.status = "正在发布到 Notion…".into();
+            self.status = format!("正在发布到 Notion…{warning}").into();
             cx.notify();
             cx.spawn(async move |editor, cx| {
                 let result = publish_notion_request(http, config, &title, &markdown).await;
                 let _ = editor.update(cx, |editor, cx| {
                     editor.status = match result {
-                        Ok(_) => "已发布到 Notion".into(),
+                        Ok(_) => format!("已发布到 Notion{warning}").into(),
                         Err(error) => format!("Notion 发布失败：{error}").into(),
                     };
                     cx.notify();
@@ -757,17 +909,18 @@ impl MarkdownEditor {
     ) {
         let markdown = self.content(cx);
         let title = document_title(&markdown);
+        let warning = local_image_warning(&markdown);
         if let Some(config) =
             TypechoConfig::from_env().or_else(|| self.publish_settings.typecho_config())
         {
             let http = cx.http_client();
-            self.status = "正在发布到 Typecho…".into();
+            self.status = format!("正在发布到 Typecho…{warning}").into();
             cx.notify();
             cx.spawn(async move |editor, cx| {
                 let result = publish_typecho_request(http, config, &title, &markdown).await;
                 let _ = editor.update(cx, |editor, cx| {
                     editor.status = match result {
-                        Ok(_) => "已提交到 Typecho".into(),
+                        Ok(_) => format!("已提交到 Typecho{warning}").into(),
                         Err(error) => format!("Typecho 发布失败：{error}").into(),
                     };
                     cx.notify();
@@ -812,9 +965,8 @@ impl MarkdownEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.text_input.update(cx, |input, cx| {
-            input.prefix_current_line(prefix, window, cx)
-        });
+        self.text_input
+            .update(cx, |input, cx| input.toggle_line_prefix(prefix, window, cx));
         self.status = message.to_owned().into();
         cx.notify();
     }
@@ -828,15 +980,15 @@ impl MarkdownEditor {
     }
 
     fn heading_action(&mut self, _: &HeadingText, window: &mut Window, cx: &mut Context<Self>) {
-        self.apply_prefix("# ", "已插入一级标题", window, cx);
+        self.apply_prefix("# ", "已切换标题", window, cx);
     }
 
     fn bullets_action(&mut self, _: &BulletsText, window: &mut Window, cx: &mut Context<Self>) {
-        self.apply_prefix("- ", "已插入无序列表", window, cx);
+        self.apply_prefix("- ", "已切换无序列表", window, cx);
     }
 
     fn quote_action(&mut self, _: &QuoteText, window: &mut Window, cx: &mut Context<Self>) {
-        self.apply_prefix("> ", "已插入引用", window, cx);
+        self.apply_prefix("> ", "已切换引用", window, cx);
     }
 
     fn link_action(&mut self, _: &LinkText, window: &mut Window, cx: &mut Context<Self>) {
@@ -919,16 +1071,12 @@ impl MarkdownEditor {
         self.insert_snippet("\n---\n".to_owned(), "已插入分隔线 Markdown", cx);
     }
 
-    fn undo_action(&mut self, _: &UndoText, _window: &mut Window, cx: &mut Context<Self>) {
-        self.text_input.update(cx, |input, cx| input.undo(cx));
-        self.status = "已撤销".into();
-        cx.notify();
+    fn undo_action(&mut self, _: &UndoText, window: &mut Window, cx: &mut Context<Self>) {
+        window.dispatch_action(Box::new(gpui_component::input::Undo), cx);
     }
 
-    fn redo_action(&mut self, _: &RedoText, _window: &mut Window, cx: &mut Context<Self>) {
-        self.text_input.update(cx, |input, cx| input.redo(cx));
-        self.status = "已重做".into();
-        cx.notify();
+    fn redo_action(&mut self, _: &RedoText, window: &mut Window, cx: &mut Context<Self>) {
+        window.dispatch_action(Box::new(gpui_component::input::Redo), cx);
     }
 
     fn format_button(
@@ -1008,6 +1156,67 @@ impl MarkdownEditor {
         }
     }
 
+    fn home_publish_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        let notion_configured =
+            NotionConfig::from_env().is_some() || self.publish_settings.notion_config().is_some();
+        let typecho_configured =
+            TypechoConfig::from_env().is_some() || self.publish_settings.typecho_config().is_some();
+        let typecho_primary =
+            typecho_is_primary_publish_target(notion_configured, typecho_configured);
+
+        type Click =
+            fn(&mut MarkdownEditor, &gpui::ClickEvent, &mut Window, &mut Context<MarkdownEditor>);
+        let (large_label, large_badged, large_click, small_icon, small_label, small_click) =
+            if typecho_primary {
+                (
+                    "Typecho",
+                    !typecho_configured,
+                    Self::publish_to_typecho_click as Click,
+                    "icons/notion.png",
+                    "Notion",
+                    Self::publish_to_notion_click as Click,
+                )
+            } else {
+                (
+                    "Notion",
+                    !notion_configured,
+                    Self::publish_to_notion_click as Click,
+                    "icons/typecho.png",
+                    "Typecho",
+                    Self::publish_to_typecho_click as Click,
+                )
+            };
+
+        ribbon_controls!(
+            ribbon_large_button_badged(
+                "icons/publish-large.png",
+                large_label,
+                large_badged,
+                cx.listener(large_click),
+            ),
+            ribbon_stack!(
+                ribbon_small_button(small_icon, small_label, cx.listener(small_click)),
+                ribbon_small_button(
+                    "icons/settings.png",
+                    "发布设置",
+                    cx.listener(|editor, _event, window, cx| {
+                        editor.toggle_settings(&ToggleSettings, window, cx)
+                    }),
+                ),
+                ribbon_small_button(
+                    "icons/preview.png",
+                    if self.preview {
+                        "返回编辑"
+                    } else {
+                        "文章预览"
+                    },
+                    cx.listener(Self::toggle_preview_click),
+                ),
+            ),
+        )
+        .into_any_element()
+    }
+
     fn ribbon(&self, cx: &mut Context<Self>) -> AnyElement {
         match self.active_tab {
             0 => div()
@@ -1019,150 +1228,212 @@ impl MarkdownEditor {
                 .bg(rgb(RIBBON_BLUE))
                 .border_b_1()
                 .border_color(rgb(BORDER))
-                .px_2()
+                .px_1()
                 .child(ribbon_group(
                     "文档",
                     ribbon_controls!(
-                        ribbon_button(
-                            "icons/new.png",
+                        ribbon_large_button(
+                            "icons/new-large.png",
                             "新建",
                             cx.listener(Self::new_document_click),
                         ),
-                        ribbon_button(
-                            "icons/open.png",
-                            "打开",
-                            cx.listener(Self::open_document_click),
+                        ribbon_stack!(
+                            ribbon_small_button(
+                                "icons/open.png",
+                                "打开",
+                                cx.listener(Self::open_document_click),
+                            ),
+                            ribbon_small_button(
+                                "icons/save.png",
+                                "保存",
+                                cx.listener(Self::save_document_click),
+                            ),
                         ),
-                        ribbon_button(
-                            "icons/save.png",
-                            "保存",
-                            cx.listener(Self::save_document_click),
-                        ),
-                        ribbon_button(
-                            "icons/open-draft.png",
-                            "打开草稿",
-                            cx.listener(Self::open_draft_click),
-                        ),
-                        ribbon_button(
-                            "icons/save-draft.png",
-                            "保存草稿",
-                            cx.listener(Self::save_draft_click),
+                        ribbon_stack!(
+                            ribbon_small_button(
+                                "icons/open-draft.png",
+                                "打开草稿",
+                                cx.listener(Self::open_draft_click),
+                            ),
+                            ribbon_small_button(
+                                "icons/save-draft.png",
+                                "保存草稿",
+                                cx.listener(Self::save_draft_click),
+                            ),
                         ),
                     ),
                 ))
+                .child(ribbon_group("发布", self.home_publish_controls(cx)))
                 .child(ribbon_group(
-                    "文本",
-                    ribbon_controls!(
-                        ribbon_button(
-                            "icons/bold.png",
-                            "粗体",
-                            cx.listener(|editor, event, window, cx| {
-                                editor.format_button(
-                                    "**",
-                                    "**",
-                                    "已插入粗体 Markdown",
-                                    event,
-                                    window,
-                                    cx,
-                                )
-                            }),
+                    "字体",
+                    div()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(ribbon_compact_button(
+                                    "icons/bold.png",
+                                    "粗体",
+                                    cx.listener(|editor, event, window, cx| {
+                                        editor.format_button(
+                                            "**",
+                                            "**",
+                                            "已插入粗体 Markdown",
+                                            event,
+                                            window,
+                                            cx,
+                                        )
+                                    }),
+                                ))
+                                .child(ribbon_compact_button(
+                                    "icons/italic.png",
+                                    "斜体",
+                                    cx.listener(|editor, event, window, cx| {
+                                        editor.format_button(
+                                            "*",
+                                            "*",
+                                            "已插入斜体 Markdown",
+                                            event,
+                                            window,
+                                            cx,
+                                        )
+                                    }),
+                                ))
+                                .child(ribbon_compact_button(
+                                    "icons/strike.png",
+                                    "删除线",
+                                    cx.listener(|editor, _event, window, cx| {
+                                        editor.strike_action(&StrikeText, window, cx)
+                                    }),
+                                ))
+                                .child(ribbon_compact_button(
+                                    "icons/code.png",
+                                    "行内代码",
+                                    cx.listener(|editor, _event, window, cx| {
+                                        editor.code_action(&CodeText, window, cx)
+                                    }),
+                                ))
+                                .child(ribbon_compact_button(
+                                    "icons/undo.png",
+                                    "撤销",
+                                    cx.listener(Self::undo_click),
+                                ))
+                                .child(ribbon_compact_button(
+                                    "icons/redo.png",
+                                    "重做",
+                                    cx.listener(Self::redo_click),
+                                )),
                         ),
-                        ribbon_button(
-                            "icons/italic.png",
-                            "斜体",
-                            cx.listener(|editor, event, window, cx| {
-                                editor.format_button(
-                                    "*",
-                                    "*",
-                                    "已插入斜体 Markdown",
-                                    event,
-                                    window,
-                                    cx,
-                                )
-                            }),
-                        ),
-                        ribbon_button(
-                            "icons/strike.png",
-                            "删除线",
-                            cx.listener(|editor, _event, window, cx| {
-                                editor.strike_action(&StrikeText, window, cx)
-                            }),
-                        ),
-                        ribbon_button(
-                            "icons/code.png",
-                            "代码",
-                            cx.listener(|editor, _event, window, cx| {
-                                editor.code_action(&CodeText, window, cx)
-                            }),
-                        ),
-                    ),
                 ))
                 .child(ribbon_group(
                     "段落",
                     ribbon_controls!(
-                        ribbon_button(
-                            "icons/bullets.png",
+                        ribbon_large_button(
+                            "icons/paragraph-large.png",
                             "列表",
                             cx.listener(|editor, event, window, cx| {
-                                editor.prefix_button("- ", "已插入无序列表", event, window, cx)
+                                editor.prefix_button("- ", "已切换无序列表", event, window, cx)
                             }),
                         ),
-                        ribbon_button(
-                            "icons/blockquote.png",
-                            "引用",
-                            cx.listener(|editor, event, window, cx| {
-                                editor.prefix_button("> ", "已插入引用", event, window, cx)
-                            }),
-                        ),
-                        ribbon_button(
-                            "icons/heading.png",
-                            "标题",
-                            cx.listener(|editor, event, window, cx| {
-                                editor.prefix_button("# ", "已插入一级标题", event, window, cx)
-                            }),
-                        ),
-                        ribbon_button(
-                            "icons/link.png",
-                            "链接",
-                            cx.listener(|editor, _event, window, cx| {
-                                editor.link_action(&LinkText, window, cx)
-                            }),
+                        ribbon_stack!(
+                            ribbon_small_button(
+                                "icons/heading.png",
+                                "标题",
+                                cx.listener(|editor, event, window, cx| {
+                                    editor.prefix_button("# ", "已切换标题", event, window, cx)
+                                }),
+                            ),
+                            ribbon_small_button(
+                                "icons/bullets.png",
+                                "待办清单",
+                                cx.listener(|editor, event, window, cx| {
+                                    editor.prefix_button(
+                                        "- [ ] ",
+                                        "已切换待办事项",
+                                        event,
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                            ),
+                            ribbon_small_button(
+                                "icons/blockquote.png",
+                                "引用",
+                                cx.listener(|editor, event, window, cx| {
+                                    editor.prefix_button("> ", "已切换引用", event, window, cx)
+                                }),
+                            ),
                         ),
                     ),
                 ))
                 .child(ribbon_group(
-                    "历史记录",
+                    "插入",
                     ribbon_controls!(
-                        ribbon_button("icons/undo.png", "撤销", cx.listener(Self::undo_click)),
-                        ribbon_button("icons/redo.png", "重做", cx.listener(Self::redo_click)),
+                        ribbon_stack!(
+                            ribbon_small_button(
+                                "icons/link.png",
+                                "超链接",
+                                cx.listener(|editor, _event, window, cx| {
+                                    editor.link_action(&LinkText, window, cx)
+                                }),
+                            ),
+                            ribbon_small_button(
+                                "icons/image.png",
+                                "图片",
+                                cx.listener(|editor, _event, window, cx| {
+                                    editor.image_action(&ImageText, window, cx)
+                                }),
+                            ),
+                            ribbon_small_button(
+                                "icons/video.png",
+                                "视频",
+                                cx.listener(|editor, _event, window, cx| {
+                                    editor.video_action(&VideoText, window, cx)
+                                }),
+                            ),
+                        ),
+                        ribbon_stack!(
+                            ribbon_small_button(
+                                "icons/table.png",
+                                "表格",
+                                cx.listener(|editor, _event, window, cx| {
+                                    editor.table_action(&TableText, window, cx)
+                                }),
+                            ),
+                            ribbon_small_button(
+                                "icons/divider.png",
+                                "分隔线",
+                                cx.listener(|editor, _event, window, cx| {
+                                    editor.divider_action(&DividerText, window, cx)
+                                }),
+                            ),
+                            ribbon_small_button(
+                                "icons/blockquote.png",
+                                "Notion 旁注",
+                                cx.listener(|editor, _event, _window, cx| {
+                                    editor.insert_snippet(
+                                        "\n<aside>💡 提示</aside>\n".to_owned(),
+                                        "已插入 Notion 旁注",
+                                        cx,
+                                    )
+                                }),
+                            ),
+                        ),
                     ),
                 ))
                 .child(ribbon_group(
-                    "文章",
-                    ribbon_controls!(
-                        ribbon_button(
-                            "icons/settings.png",
-                            "设置",
-                            cx.listener(|editor, _event, window, cx| {
-                                editor.toggle_settings(&ToggleSettings, window, cx)
-                            }),
-                        ),
-                        ribbon_button(
-                            "icons/notion.png",
-                            "Notion",
-                            cx.listener(Self::publish_to_notion_click),
-                        ),
-                        ribbon_button(
-                            "icons/typecho.png",
-                            "Typecho",
-                            cx.listener(Self::publish_to_typecho_click),
-                        ),
-                        ribbon_button(
-                            "icons/preview.png",
-                            if self.preview { "编辑" } else { "预览" },
-                            cx.listener(Self::toggle_preview_click),
-                        ),
-                    ),
+                    "编辑",
+                    ribbon_controls!(ribbon_large_button(
+                        "icons/preview-large.png",
+                        if self.preview { "编辑" } else { "预览" },
+                        cx.listener(Self::toggle_preview_click),
+                    ),),
                 ))
                 .into_any_element(),
             1 => div()
@@ -1174,94 +1445,135 @@ impl MarkdownEditor {
                 .bg(rgb(RIBBON_BLUE))
                 .border_b_1()
                 .border_color(rgb(BORDER))
-                .px_2()
+                .px_1()
                 .child(ribbon_group(
-                    "Markdown",
+                    "Markdown 块",
                     ribbon_controls!(
-                        ribbon_button(
-                            "icons/heading.png",
+                        ribbon_large_button(
+                            "icons/html-large.png",
                             "标题",
                             cx.listener(|editor, event, window, cx| {
-                                editor.prefix_button("# ", "已插入一级标题", event, window, cx)
+                                editor.prefix_button("# ", "已切换标题", event, window, cx)
                             }),
                         ),
-                        ribbon_button(
-                            "icons/bullets.png",
-                            "列表",
-                            cx.listener(|editor, event, window, cx| {
-                                editor.prefix_button("- ", "已插入无序列表", event, window, cx)
-                            }),
+                        ribbon_stack!(
+                            ribbon_small_button(
+                                "icons/bullets.png",
+                                "项目列表",
+                                cx.listener(|editor, event, window, cx| {
+                                    editor.prefix_button("- ", "已切换无序列表", event, window, cx)
+                                }),
+                            ),
+                            ribbon_small_button(
+                                "icons/bullets.png",
+                                "待办清单",
+                                cx.listener(|editor, event, window, cx| {
+                                    editor.prefix_button(
+                                        "- [ ] ",
+                                        "已切换待办事项",
+                                        event,
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                            ),
+                            ribbon_small_button(
+                                "icons/blockquote.png",
+                                "引用",
+                                cx.listener(|editor, event, window, cx| {
+                                    editor.prefix_button("> ", "已切换引用", event, window, cx)
+                                }),
+                            ),
                         ),
-                        ribbon_button(
-                            "icons/blockquote.png",
-                            "引用",
-                            cx.listener(|editor, event, window, cx| {
-                                editor.prefix_button("> ", "已插入引用", event, window, cx)
-                            }),
-                        ),
-                        ribbon_button(
-                            "icons/link.png",
-                            "链接",
-                            cx.listener(|editor, _event, window, cx| {
-                                editor.link_action(&LinkText, window, cx)
-                            }),
-                        ),
-                        ribbon_button(
-                            "icons/strike.png",
-                            "删除线",
-                            cx.listener(|editor, _event, window, cx| {
-                                editor.strike_action(&StrikeText, window, cx)
-                            }),
-                        ),
-                        ribbon_button(
-                            "icons/code.png",
-                            "代码",
-                            cx.listener(|editor, _event, window, cx| {
-                                editor.code_action(&CodeText, window, cx)
-                            }),
+                        ribbon_stack!(
+                            ribbon_small_button(
+                                "icons/code.png",
+                                "代码",
+                                cx.listener(|editor, _event, window, cx| {
+                                    editor.code_action(&CodeText, window, cx)
+                                }),
+                            ),
+                            ribbon_small_button(
+                                "icons/strike.png",
+                                "删除线",
+                                cx.listener(|editor, _event, window, cx| {
+                                    editor.strike_action(&StrikeText, window, cx)
+                                }),
+                            ),
+                            ribbon_small_button(
+                                "icons/blockquote.png",
+                                "Notion 旁注",
+                                cx.listener(|editor, _event, _window, cx| {
+                                    editor.insert_snippet(
+                                        "\n<aside>💡 提示</aside>\n".to_owned(),
+                                        "已插入 Notion 旁注",
+                                        cx,
+                                    )
+                                }),
+                            ),
                         ),
                     ),
                 ))
                 .child(ribbon_group(
                     "媒体",
                     ribbon_controls!(
-                        ribbon_button(
-                            "icons/image.png",
+                        ribbon_large_button(
+                            "icons/image-large.png",
                             "图片",
                             cx.listener(|editor, _event, window, cx| {
                                 editor.image_action(&ImageText, window, cx)
                             }),
                         ),
-                        ribbon_button(
-                            "icons/video.png",
-                            "视频",
-                            cx.listener(|editor, _event, window, cx| {
-                                editor.video_action(&VideoText, window, cx)
-                            }),
+                        ribbon_stack!(
+                            ribbon_small_button(
+                                "icons/link.png",
+                                "超链接",
+                                cx.listener(|editor, _event, window, cx| {
+                                    editor.link_action(&LinkText, window, cx)
+                                }),
+                            ),
+                            ribbon_small_button(
+                                "icons/video.png",
+                                "视频",
+                                cx.listener(|editor, _event, window, cx| {
+                                    editor.video_action(&VideoText, window, cx)
+                                }),
+                            ),
                         ),
                     ),
                 ))
                 .child(ribbon_group(
                     "结构",
                     ribbon_controls!(
-                        ribbon_button(
-                            "icons/table.png",
+                        ribbon_large_button(
+                            "icons/table-large.png",
                             "表格",
                             cx.listener(|editor, _event, window, cx| {
                                 editor.table_action(&TableText, window, cx)
                             }),
                         ),
-                        ribbon_button(
-                            "icons/divider.png",
-                            "分隔线",
-                            cx.listener(|editor, _event, window, cx| {
-                                editor.divider_action(&DividerText, window, cx)
-                            }),
+                        ribbon_stack!(
+                            ribbon_small_button(
+                                "icons/divider.png",
+                                "分隔线",
+                                cx.listener(|editor, _event, window, cx| {
+                                    editor.divider_action(&DividerText, window, cx)
+                                }),
+                            ),
+                            ribbon_small_button(
+                                "icons/preview.png",
+                                if self.preview {
+                                    "返回编辑"
+                                } else {
+                                    "实时预览"
+                                },
+                                cx.listener(Self::toggle_preview_click),
+                            ),
                         ),
                     ),
                 ))
                 .into_any_element(),
-            _ => div()
+            2 => div()
                 .h(RIBBON_HEIGHT)
                 .w_full()
                 .flex()
@@ -1270,58 +1582,113 @@ impl MarkdownEditor {
                 .bg(rgb(RIBBON_BLUE))
                 .border_b_1()
                 .border_color(rgb(BORDER))
-                .px_2()
+                .px_1()
+                .child(ribbon_group(
+                    "发布",
+                    ribbon_controls!(
+                        ribbon_large_button_badged(
+                            "icons/publish-large.png",
+                            "Notion",
+                            !(NotionConfig::from_env().is_some()
+                                || self.publish_settings.notion_config().is_some()),
+                            cx.listener(Self::publish_to_notion_click),
+                        ),
+                        ribbon_large_button_badged(
+                            "icons/publish-large.png",
+                            "Typecho",
+                            !(TypechoConfig::from_env().is_some()
+                                || self.publish_settings.typecho_config().is_some()),
+                            cx.listener(Self::publish_to_typecho_click),
+                        ),
+                    ),
+                ))
                 .child(ribbon_group(
                     "草稿",
                     ribbon_controls!(
-                        ribbon_button(
-                            "icons/new.png",
-                            "新建",
-                            cx.listener(Self::new_document_click),
-                        ),
-                        ribbon_button(
-                            "icons/open-draft.png",
+                        ribbon_large_button(
+                            "icons/open-large.png",
                             "打开草稿",
                             cx.listener(Self::open_draft_click),
                         ),
-                        ribbon_button(
-                            "icons/save-draft.png",
+                        ribbon_large_button(
+                            "icons/save-large.png",
                             "保存草稿",
                             cx.listener(Self::save_draft_click),
                         ),
                     ),
                 ))
                 .child(ribbon_group(
-                    "发布",
+                    "文章选项",
                     ribbon_controls!(
-                        ribbon_button(
-                            "icons/notion.png",
-                            "Notion",
-                            cx.listener(Self::publish_to_notion_click),
-                        ),
-                        ribbon_button(
-                            "icons/typecho.png",
-                            "Typecho",
-                            cx.listener(Self::publish_to_typecho_click),
-                        ),
-                    ),
-                ))
-                .child(ribbon_group(
-                    "查看",
-                    ribbon_controls!(
-                        ribbon_button(
-                            "icons/preview.png",
-                            if self.preview { "编辑" } else { "预览" },
-                            cx.listener(Self::toggle_preview_click),
-                        ),
-                        ribbon_button(
-                            "icons/settings.png",
+                        ribbon_large_button(
+                            "icons/settings-large.png",
                             "设置",
                             cx.listener(|editor, _event, window, cx| {
                                 editor.toggle_settings(&ToggleSettings, window, cx)
                             }),
                         ),
+                        ribbon_large_button(
+                            "icons/preview-large.png",
+                            if self.preview { "编辑" } else { "预览" },
+                            cx.listener(Self::toggle_preview_click),
+                        ),
                     ),
+                ))
+                .into_any_element(),
+            _ => div()
+                .h(RIBBON_HEIGHT)
+                .w_full()
+                .flex()
+                .id("ribbon-file-scroll")
+                .overflow_x_scroll()
+                .bg(rgb(RIBBON_BLUE))
+                .border_b_1()
+                .border_color(rgb(BORDER))
+                .px_1()
+                .child(ribbon_group(
+                    "文件",
+                    ribbon_controls!(
+                        ribbon_large_button(
+                            "icons/new-large.png",
+                            "新建",
+                            cx.listener(Self::new_document_click),
+                        ),
+                        ribbon_large_button(
+                            "icons/open-large.png",
+                            "打开",
+                            cx.listener(Self::open_document_click),
+                        ),
+                        ribbon_large_button(
+                            "icons/save-large.png",
+                            "保存",
+                            cx.listener(Self::save_document_click),
+                        ),
+                    ),
+                ))
+                .child(ribbon_group(
+                    "草稿",
+                    ribbon_controls!(
+                        ribbon_large_button(
+                            "icons/open-large.png",
+                            "打开草稿",
+                            cx.listener(Self::open_draft_click),
+                        ),
+                        ribbon_large_button(
+                            "icons/save-large.png",
+                            "保存草稿",
+                            cx.listener(Self::save_draft_click),
+                        ),
+                    ),
+                ))
+                .child(ribbon_group(
+                    "选项",
+                    ribbon_controls!(ribbon_large_button(
+                        "icons/settings-large.png",
+                        "发布设置",
+                        cx.listener(|editor, _event, window, cx| {
+                            editor.toggle_settings(&ToggleSettings, window, cx)
+                        }),
+                    ),),
                 ))
                 .into_any_element(),
         }
@@ -1329,7 +1696,7 @@ impl MarkdownEditor {
 }
 
 impl Render for MarkdownEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self
             .path
             .as_ref()
@@ -1341,6 +1708,11 @@ impl Render for MarkdownEditor {
         } else {
             title.to_owned()
         };
+        let window_title = format!("{title} — Open Live Writer");
+        if self.last_window_title != window_title {
+            self.last_window_title = window_title.clone();
+            window.set_window_title(&window_title);
+        }
         let content = self.text_input.read(cx).content.clone();
         let workspace = if self.settings_visible {
             div()
@@ -1441,9 +1813,17 @@ impl Render for MarkdownEditor {
                     .w_full()
                     .flex()
                     .items_center()
-                    .gap_1()
-                    .bg(rgb(BLUE))
-                    .px_3()
+                    .bg(rgb(0xf5f6f8))
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .px_2()
+                    .child(file_tab(
+                        self.active_tab == 3,
+                        cx.listener(|editor, _, _, cx| {
+                            editor.active_tab = 3;
+                            cx.notify();
+                        }),
+                    ))
                     .child(tab(
                         "主页",
                         self.active_tab == 0,
@@ -1508,6 +1888,92 @@ fn normalize_newlines(content: String) -> String {
     content.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+fn prepare_content(content: String) -> (String, String, bool) {
+    let utf8_bom = content.starts_with('\u{feff}');
+    let content = if utf8_bom {
+        content.trim_start_matches('\u{feff}').to_owned()
+    } else {
+        content
+    };
+    let line_ending = if content.contains("\r\n") {
+        "\r\n".to_owned()
+    } else {
+        "\n".to_owned()
+    };
+    (normalize_newlines(content), line_ending, utf8_bom)
+}
+
+fn decode_markdown(bytes: &[u8]) -> Result<String, String> {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(bytes[3..].to_vec())
+            .map_err(|error| format!("UTF-8 解码失败：{error}"));
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let units = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        return Ok(String::from_utf16_lossy(&units));
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let units = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        return Ok(String::from_utf16_lossy(&units));
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok(text.to_owned());
+    }
+    let (decoded, _, _) = encoding_rs::GBK.decode(bytes);
+    Ok(decoded.into_owned())
+}
+
+fn default_save_directory() -> PathBuf {
+    if cfg!(target_os = "windows")
+        && let Some(profile) = std::env::var_os("USERPROFILE")
+    {
+        let documents = PathBuf::from(profile).join("Documents");
+        if documents.is_dir() {
+            return documents;
+        }
+    }
+    if cfg!(target_os = "macos")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        let documents = PathBuf::from(home).join("Documents");
+        if documents.is_dir() {
+            return documents;
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn local_image_warning(markdown: &str) -> String {
+    let count = local_image_count(markdown);
+    if count > 0 {
+        format!("（含 {count} 处本地图片，发布后可能无法显示）")
+    } else {
+        String::new()
+    }
+}
+
+fn utf16_offset_from_utf8(text: &str, byte_offset: usize) -> usize {
+    let mut utf16 = 0;
+    for (index, character) in text.char_indices() {
+        if index >= byte_offset {
+            break;
+        }
+        utf16 += character.len_utf16();
+    }
+    utf16
+}
+
+fn utf16_range_from_utf8(text: &str, range: Range<usize>) -> Range<usize> {
+    utf16_offset_from_utf8(text, range.start)..utf16_offset_from_utf8(text, range.end)
+}
+
+#[cfg(test)]
 fn utf8_offset_from_utf16(text: &str, offset: usize) -> usize {
     let mut utf16 = 0;
     for (index, character) in text.char_indices() {
@@ -1519,6 +1985,7 @@ fn utf8_offset_from_utf16(text: &str, offset: usize) -> usize {
     text.len()
 }
 
+#[cfg(test)]
 fn utf16_range_to_utf8(text: &str, range: &Range<usize>) -> Range<usize> {
     utf8_offset_from_utf16(text, range.start)..utf8_offset_from_utf16(text, range.end)
 }
@@ -1549,11 +2016,66 @@ fn is_image_path(path: &Path) -> bool {
 }
 
 fn markdown_image_url(path: &Path) -> String {
-    let path = path.to_string_lossy().replace('\\', "/");
+    let path = percent_encode_path(&path.to_string_lossy().replace('\\', "/"));
     if path.starts_with('/') {
         format!("file://{path}")
     } else {
         format!("file:///{path}")
+    }
+}
+
+fn percent_encode_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b':' | b'/' | b'.' | b'-' | b'_' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    encoded
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            decoded.push(high * 16 + low);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn preview_image_source(url: &str) -> ImageSource {
+    let decoded = percent_decode(url);
+    if let Some(path) = decoded.strip_prefix("file:///") {
+        ImageSource::from(PathBuf::from(path))
+    } else if let Some(path) = decoded.strip_prefix("file://") {
+        ImageSource::from(PathBuf::from(path))
+    } else {
+        ImageSource::from(decoded)
     }
 }
 
@@ -1589,8 +2111,11 @@ fn editor_panel(input: Entity<MarkdownInput>, width: Option<f32>) -> impl IntoEl
             div()
                 .id("markdown-editor-scroll")
                 .flex_grow()
+                .w_full()
                 .min_h_0()
-                .overflow_scroll()
+                .min_w_0()
+                .overflow_y_scroll()
+                .overflow_x_hidden()
                 .p_5()
                 .child(input),
         )
@@ -1624,8 +2149,12 @@ fn preview_panel(content: SharedString, label: &'static str) -> impl IntoElement
             div()
                 .id("markdown-preview-scroll")
                 .flex_grow()
+                .w_full()
                 .min_h_0()
+                .min_w_0()
                 .overflow_y_scroll()
+                .overflow_x_hidden()
+                .whitespace_normal()
                 .p_5()
                 .children(markdown_preview(content.as_ref())),
         )
@@ -1773,30 +2302,46 @@ fn tab(
     active: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let background = if active { rgb(0xffffff) } else { rgb(BLUE) };
-    let foreground = if active {
-        hsla(0.58, 0.52, 0.47, 1.)
-    } else {
-        white()
-    };
+    let background = if active { rgb(0xffffff) } else { rgb(0xf5f6f8) };
+    let foreground = if active { rgb(DARK_BLUE) } else { rgb(TEXT) };
     div()
         .id(label)
         .h(RIBBON_TAB_HEIGHT)
-        .px_3()
+        .px_4()
         .flex()
         .items_center()
-        .rounded_t_sm()
         .bg(background)
+        .border_1()
+        .border_color(if active { rgb(BORDER) } else { rgb(0xf5f6f8) })
         .text_size(px(14.))
         .text_color(foreground)
         .hover(|style| {
             style
-                .bg(if active { rgb(0xffffff) } else { rgb(0x568ac0) })
+                .bg(if active { rgb(0xffffff) } else { rgb(0xe7f0f9) })
                 .cursor_pointer()
         })
         .active(|style| style.bg(rgb(0xd7e8f6)))
         .on_click(on_click)
         .child(label)
+}
+
+fn file_tab(
+    active: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id("文件")
+        .h(RIBBON_TAB_HEIGHT)
+        .px_5()
+        .flex()
+        .items_center()
+        .bg(if active { rgb(DARK_BLUE) } else { rgb(BLUE) })
+        .text_size(px(14.))
+        .text_color(white())
+        .hover(|style| style.bg(rgb(DARK_BLUE)).cursor_pointer())
+        .active(|style| style.bg(rgb(0x244f7c)))
+        .on_click(on_click)
+        .child("文件")
 }
 
 fn ribbon_group(label: &'static str, controls: impl IntoElement) -> impl IntoElement {
@@ -1806,6 +2351,7 @@ fn ribbon_group(label: &'static str, controls: impl IntoElement) -> impl IntoEle
         .flex_col()
         .flex_none()
         .px_1()
+        .pt(px(2.))
         .border_r_1()
         .border_color(rgb(RIBBON_SEPARATOR))
         .child(
@@ -1824,20 +2370,29 @@ fn ribbon_group(label: &'static str, controls: impl IntoElement) -> impl IntoEle
                 .items_center()
                 .justify_center()
                 .text_xs()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(0x75879a))
                 .child(label),
         )
 }
 
-fn ribbon_button(
+fn ribbon_large_button(
     icon: &'static str,
     label: &'static str,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    ribbon_large_button_badged(icon, label, false, on_click)
+}
+
+fn ribbon_large_button_badged(
+    icon: &'static str,
+    label: &'static str,
+    badged: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     div()
         .id(label)
-        .w(RIBBON_BUTTON_WIDTH)
-        .h(RIBBON_BUTTON_HEIGHT)
+        .w(RIBBON_LARGE_BUTTON_WIDTH)
+        .h(RIBBON_LARGE_BUTTON_HEIGHT)
         .flex()
         .flex_col()
         .flex_none()
@@ -1874,12 +2429,25 @@ fn ribbon_button(
         .on_click(on_click)
         .child(
             div()
-                .w(px(20.))
-                .h(px(20.))
+                .w(px(34.))
+                .h(px(34.))
+                .relative()
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(ribbon_icon(icon).size_4()),
+                .child(ribbon_icon(icon).w(px(32.)).h(px(32.)))
+                .when(badged, |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top(px(0.))
+                            .right(px(0.))
+                            .w(px(9.))
+                            .h(px(9.))
+                            .rounded_full()
+                            .bg(rgb(0xd64545)),
+                    )
+                }),
         )
         .child(
             div()
@@ -1893,12 +2461,93 @@ fn ribbon_button(
         )
 }
 
+fn ribbon_small_button(
+    icon: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(label)
+        .min_w(px(84.))
+        .h(RIBBON_SMALL_BUTTON_HEIGHT)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .px_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(hsla(0., 0., 0., 0.))
+        .text_size(px(12.))
+        .text_color(rgb(TEXT))
+        .hover(|style| {
+            style
+                .bg(linear_gradient(
+                    0.,
+                    linear_color_stop(rgb(0xffffff), 0.),
+                    linear_color_stop(rgb(0xdcecf9), 1.),
+                ))
+                .border_color(rgb(0x8db6d9))
+                .cursor_pointer()
+        })
+        .active(|style| style.bg(rgb(0xc8dff2)).border_color(rgb(0x5b91c2)))
+        .on_click(on_click)
+        .child(
+            div()
+                .w(px(18.))
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(ribbon_icon(icon).size_4()),
+        )
+        .child(label)
+}
+
+fn ribbon_compact_button(
+    icon: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(label)
+        .w(px(28.))
+        .h(px(23.))
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(hsla(0., 0., 0., 0.))
+        .hover(|style| {
+            style
+                .bg(linear_gradient(
+                    0.,
+                    linear_color_stop(rgb(0xffffff), 0.),
+                    linear_color_stop(rgb(0xdcecf9), 1.),
+                ))
+                .border_color(rgb(0x8db6d9))
+                .cursor_pointer()
+        })
+        .active(|style| style.bg(rgb(0xc8dff2)).border_color(rgb(0x5b91c2)))
+        .on_click(on_click)
+        .child(ribbon_icon(icon).size_4())
+}
+
 fn ribbon_icon(path: &'static str) -> Img {
-    let asset = EmbeddedAssets::get(path).expect("missing embedded ribbon icon");
-    img(Arc::new(Image::from_bytes(
-        ImageFormat::Png,
-        asset.data.into_owned(),
-    )))
+    static CACHE: OnceLock<Mutex<HashMap<&'static str, Arc<Image>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let image = cache
+        .lock()
+        .unwrap()
+        .entry(path)
+        .or_insert_with(|| {
+            let asset = EmbeddedAssets::get(path).expect("missing embedded ribbon icon");
+            Arc::new(Image::from_bytes(ImageFormat::Png, asset.data.into_owned()))
+        })
+        .clone();
+    img(image)
 }
 
 fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
@@ -1952,6 +2601,38 @@ fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
                 .child(format!("{}. ", marker))
                 .child(inline_preview(&text))
                 .into_any_element(),
+            Block::Task { checked, text } => {
+                let checkbox = div()
+                    .w(px(18.))
+                    .h(px(18.))
+                    .mt(px(3.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(BLUE))
+                    .when(checked, |this| {
+                        this.bg(rgb(BLUE)).text_color(white()).child("✓")
+                    })
+                    .when(!checked, |this| this.bg(white()));
+                div()
+                    .id(("preview-task", index))
+                    .w_full()
+                    .mb_1()
+                    .pl_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_base()
+                    .child(checkbox)
+                    .child(
+                        div()
+                            .when(checked, |this| this.text_color(rgb(MUTED)).line_through())
+                            .child(inline_preview(&text)),
+                    )
+                    .into_any_element()
+            }
             Block::Quote(text) => div()
                 .id(("preview-quote", index))
                 .w_full()
@@ -1963,7 +2644,34 @@ fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
                 .text_color(rgb(MUTED))
                 .child(inline_preview(&text))
                 .into_any_element(),
-            Block::Code(text) => div()
+            Block::Aside(text) => {
+                let content = if text.trim().is_empty() {
+                    "旁注".to_owned()
+                } else {
+                    text
+                };
+                div()
+                    .id(("preview-aside", index))
+                    .w_full()
+                    .mb_3()
+                    .p_3()
+                    .flex()
+                    .gap_2()
+                    .rounded_sm()
+                    .border_l_4()
+                    .border_color(rgb(0x72a7d8))
+                    .bg(rgb(0xeaf3fc))
+                    .child(div().text_lg().child("💡"))
+                    .child(
+                        div()
+                            .flex_grow()
+                            .min_w_0()
+                            .line_height(px(24.))
+                            .child(inline_preview(&content)),
+                    )
+                    .into_any_element()
+            }
+            Block::Code { text, language } => div()
                 .id(("preview-code", index))
                 .w_full()
                 .mb_3()
@@ -1973,7 +2681,21 @@ fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
                 .border_1()
                 .border_color(rgb(0xdfe3e8))
                 .text_color(rgb(0x38434d))
-                .child(text)
+                .when(language.is_some(), |this| {
+                    this.child(
+                        div()
+                            .mb_1()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(language.clone().unwrap_or_default()),
+                    )
+                })
+                .child(
+                    div()
+                        .w_full()
+                        .font_family("Menlo, Monaco, Consolas, monospace")
+                        .child(text),
+                )
                 .into_any_element(),
             Block::Image { alt, url } => div()
                 .id(("preview-image", index))
@@ -1982,7 +2704,7 @@ fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(img(url).max_w_full())
+                .child(img(preview_image_source(&url)).max_w_full())
                 .child(div().text_xs().text_color(rgb(MUTED)).child(alt))
                 .into_any_element(),
             Block::Video { url } => div()
@@ -2020,6 +2742,19 @@ fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
                 .my_3()
                 .bg(rgb(BORDER))
                 .into_any_element(),
+            Block::Html(text) => div()
+                .id(("preview-html", index))
+                .w_full()
+                .mb_3()
+                .p_3()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(0xf7f9fb))
+                .text_color(rgb(0x38434d))
+                .child(div().text_xs().text_color(rgb(MUTED)).child("HTML"))
+                .child(text)
+                .into_any_element(),
         })
         .collect()
 }
@@ -2045,77 +2780,55 @@ fn preview_table_row(cells: Vec<String>, header: bool, index: usize) -> gpui::An
 }
 
 fn inline_preview(markdown: &str) -> gpui::AnyElement {
-    let mut children = Vec::new();
-    let mut offset = 0;
-    while offset < markdown.len() {
-        let rest = &markdown[offset..];
-        let Some((marker_offset, marker)) = next_preview_marker(rest) else {
-            children.push(preview_inline_piece(rest, None));
-            break;
-        };
-        if marker_offset > 0 {
-            children.push(preview_inline_piece(&rest[..marker_offset], None));
-            offset += marker_offset;
-            continue;
-        }
-        if marker == "["
-            && let Some(label_end) = rest.find("](")
-            && let Some(url_end) = rest[label_end + 2..].find(')')
-        {
-            let label = &rest[1..label_end];
-            children.push(preview_inline_piece(label, Some("link")));
-            offset += label_end + 2 + url_end + 1;
-            continue;
-        }
-        if let Some(close_offset) = rest[marker.len()..].find(marker) {
-            let start = marker.len();
-            let end = start + close_offset;
-            let style = match marker {
-                "**" | "__" => Some("bold"),
-                "*" | "_" => Some("italic"),
-                "~~" => Some("strike"),
-                INLINE_CODE_MARKER => Some("code"),
-                _ => None,
-            };
-            if style.is_some() {
-                children.push(preview_inline_piece(&rest[start..end], style));
-                offset += end + marker.len();
-                continue;
-            }
-        }
-        children.push(preview_inline_piece(marker, None));
-        offset += marker.len();
-    }
+    let children = parse_inline(markdown)
+        .iter()
+        .map(preview_inline_piece)
+        .collect::<Vec<_>>();
     div()
+        .w_full()
+        .max_w_full()
+        .min_w_0()
         .flex()
         .flex_wrap()
+        .whitespace_normal()
+        .overflow_x_hidden()
         .children(children)
         .into_any_element()
 }
 
-fn next_preview_marker(text: &str) -> Option<(usize, &'static str)> {
-    ["**", "__", "~~", "*", "_", INLINE_CODE_MARKER, "["]
-        .into_iter()
-        .filter_map(|marker| text.find(marker).map(|offset| (offset, marker)))
-        .min_by_key(|(offset, _)| *offset)
-}
-
-fn preview_inline_piece(text: &str, style: Option<&str>) -> gpui::AnyElement {
-    let mut piece = div().child(text.to_owned());
-    match style {
-        Some("bold") => piece = piece.font_weight(FontWeight(700.)),
-        Some("italic") => piece = piece.italic(),
-        Some("strike") => piece = piece.line_through(),
-        Some("code") => piece = piece.bg(rgb(0xf1f3f5)).px_1(),
-        Some("link") => piece = piece.text_color(rgb(BLUE)).underline(),
-        _ => {}
+fn preview_inline_piece(piece: &RichTextPiece) -> gpui::AnyElement {
+    if let Some(url) = &piece.image {
+        return img(preview_image_source(url))
+            .max_h(px(160.))
+            .max_w_full()
+            .into_any_element();
     }
-    piece.into_any_element()
+    let mut element = div()
+        .min_w_0()
+        .max_w_full()
+        .flex_shrink()
+        .whitespace_normal()
+        .child(piece.text.clone());
+    for style in &piece.styles {
+        element = match style {
+            InlineStyle::Bold => element.font_weight(FontWeight(700.)),
+            InlineStyle::Italic => element.italic(),
+            InlineStyle::Strike => element.line_through(),
+            InlineStyle::Code => element.bg(rgb(0xf1f3f5)).px_1(),
+        };
+    }
+    if piece.link.is_some() {
+        element = element.text_color(rgb(BLUE)).underline();
+    }
+    element.into_any_element()
 }
 
 fn main() {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         gpui_component::init(cx);
+        // The application uses a fixed light Windows Live Writer palette. Keep the component
+        // editor in the matching light theme instead of inheriting the system dark theme.
+        Theme::change(ThemeMode::Light, None, cx);
         cx.bind_keys([
             KeyBinding::new("secondary-n", NewDocument, None),
             KeyBinding::new("secondary-o", OpenDocument, None),
@@ -2134,7 +2847,9 @@ fn main() {
             KeyBinding::new("secondary-shift-t", PublishToTypecho, None),
             KeyBinding::new("secondary-q", QuitApplication, None),
         ]);
-        let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
+        // GPUI uses logical pixels. At 200% Windows scaling this opens at roughly
+        // 2260 x 1500 physical pixels, wide enough to show the complete Home ribbon.
+        let bounds = Bounds::centered(None, size(px(1130.), px(750.)), cx);
         let mut editor_entity = None;
         let mut editor_focus_handle = None;
         let window = cx
@@ -2163,30 +2878,87 @@ fn main() {
             .update(cx, |_, window, cx| {
                 window.focus(&editor_focus_handle);
                 let editor = editor_entity.downgrade();
+                if let Ok(Some(content)) = storage::load_autosave() {
+                    let autosave_editor = editor_entity.downgrade();
+                    window
+                        .spawn(cx, async move |cx| {
+                            let answer = cx.update(|window, cx| {
+                                window.prompt(
+                                    gpui::PromptLevel::Warning,
+                                    "检测到未保存的自动备份",
+                                    Some("上次退出时存在未保存的修改，是否恢复？"),
+                                    &["恢复备份", "放弃备份"],
+                                    cx,
+                                )
+                            });
+                            let Some(answer) = answer.ok() else {
+                                return;
+                            };
+                            let choice = answer.await.ok();
+                            let _ = autosave_editor.update(cx, |editor, cx| {
+                                if choice == Some(0) {
+                                    editor.restore_autosave(content.clone(), cx);
+                                }
+                                let _ = storage::clear_autosave();
+                            });
+                        })
+                        .detach();
+                }
                 window.on_window_should_close(cx, move |window, cx| {
-                    let (dirty, close_confirmed) = editor
-                        .read_with(cx, |editor, _| (editor.dirty, editor.close_confirmed))
-                        .unwrap_or((false, false));
+                    let (dirty, close_confirmed, path) = editor
+                        .read_with(cx, |editor, _| {
+                            (editor.dirty, editor.close_confirmed, editor.path.clone())
+                        })
+                        .unwrap_or((false, false, None));
                     if !dirty || close_confirmed {
                         return true;
                     }
                     let answer = window.prompt(
                         gpui::PromptLevel::Warning,
                         "当前文章有未保存的修改",
-                        Some("关闭后这些修改将丢失。"),
-                        &["放弃并关闭", "取消"],
+                        Some("请选择保存并关闭、放弃修改并关闭，或取消。"),
+                        &["保存并关闭", "放弃并关闭", "取消"],
                         cx,
                     );
                     let editor_for_prompt = editor.clone();
                     window
-                        .spawn(cx, async move |cx| {
-                            if answer.await.ok() == Some(0) {
+                        .spawn(cx, async move |cx| match answer.await.ok() {
+                            Some(0) => {
+                                if let Some(path) = path.clone() {
+                                    let _ = editor_for_prompt.update(cx, |editor, cx| {
+                                        editor.save_to(path, cx);
+                                        editor.close_confirmed = true;
+                                        cx.notify();
+                                    });
+                                    let _ = cx.update(|window, _| window.remove_window());
+                                    return;
+                                }
+                                let Ok(receiver) = cx.update(|_, cx| {
+                                    cx.prompt_for_new_path(
+                                        &default_save_directory(),
+                                        Some("未命名文章.md"),
+                                    )
+                                }) else {
+                                    return;
+                                };
+                                let Ok(Ok(Some(path))) = receiver.await else {
+                                    return;
+                                };
+                                let _ = editor_for_prompt.update(cx, |editor, cx| {
+                                    editor.save_to(path, cx);
+                                    editor.close_confirmed = true;
+                                    cx.notify();
+                                });
+                                let _ = cx.update(|window, _| window.remove_window());
+                            }
+                            Some(1) => {
                                 let _ = editor_for_prompt.update(cx, |editor, cx| {
                                     editor.close_confirmed = true;
                                     cx.notify();
                                 });
                                 let _ = cx.update(|window, _| window.remove_window());
                             }
+                            _ => {}
                         })
                         .detach();
                     false
@@ -2203,7 +2975,7 @@ mod tests {
 
     use super::{
         EmbeddedAssets, is_image_path, line_end, line_starts, markdown_image_url,
-        normalize_newlines, utf16_range_to_utf8,
+        normalize_newlines, percent_decode, typecho_is_primary_publish_target, utf16_range_to_utf8,
     };
 
     #[test]
@@ -2222,13 +2994,30 @@ mod tests {
     fn accepts_common_image_files_and_builds_file_urls() {
         let path = Path::new("/tmp/封面.png");
         assert!(is_image_path(path));
-        assert_eq!(markdown_image_url(path), "file:///tmp/封面.png");
+        assert_eq!(
+            markdown_image_url(path),
+            "file:///tmp/%E5%B0%81%E9%9D%A2.png"
+        );
+        assert_eq!(percent_decode("%E5%B0%81%E9%9D%A2"), "封面");
+        assert_eq!(percent_decode("a%20b.png"), "a b.png");
         assert!(!is_image_path(Path::new("/tmp/article.md")));
+    }
+
+    #[test]
+    fn promotes_the_only_configured_publish_target() {
+        assert!(typecho_is_primary_publish_target(false, true));
+        assert!(!typecho_is_primary_publish_target(true, false));
+        assert!(!typecho_is_primary_publish_target(true, true));
+        assert!(!typecho_is_primary_publish_target(false, false));
     }
 
     #[test]
     fn embeds_ribbon_icons() {
         assert!(EmbeddedAssets::get("icons/new.png").is_some());
+        assert!(EmbeddedAssets::get("icons/new-large.png").is_some());
+        assert!(EmbeddedAssets::get("icons/publish-large.png").is_some());
+        assert!(EmbeddedAssets::get("icons/paragraph-large.png").is_some());
+        assert!(EmbeddedAssets::get("icons/preview-large.png").is_some());
         assert!(EmbeddedAssets::get("icons/open-draft.png").is_some());
         assert!(EmbeddedAssets::get("icons/save-draft.png").is_some());
         assert!(EmbeddedAssets::get("icons/divider.png").is_some());

@@ -6,10 +6,9 @@ use gpui::http_client::{AsyncBody, HttpClient, Method, Request};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::markdown::{Block, parse_blocks, strip_inline};
+use crate::markdown::{Block, InlineStyle, parse_blocks, parse_inline, strip_inline};
 
 const NOTION_VERSION: &str = "2022-06-28";
-const CODE_MARKER: &str = "\x60";
 pub const CREDENTIALS_URL: &str = "open-live-writer://publishing";
 pub const CREDENTIALS_USERNAME: &str = "open-live-writer";
 
@@ -122,7 +121,12 @@ pub async fn publish_to_typecho(
     title: &str,
     markdown: &str,
 ) -> Result<String> {
-    let body = metaweblog_new_post_xml(&config.username, &config.password, title, markdown);
+    let body = metaweblog_new_post_xml(
+        &config.username,
+        &config.password,
+        title,
+        &markdown_to_html(markdown),
+    );
     let request = Request::builder()
         .method(Method::POST)
         .uri(&config.xmlrpc_url)
@@ -162,6 +166,47 @@ pub fn notion_blocks(markdown: &str) -> Result<Vec<Value>> {
     Ok(blocks.into_iter().map(block_to_notion).collect())
 }
 
+pub fn local_image_count(markdown: &str) -> usize {
+    markdown.matches("file://").count()
+}
+
+/// Typecho's MetaWeblog endpoint renders the post body as HTML, so convert the
+/// Markdown source before sending it.
+pub fn markdown_to_html(markdown: &str) -> String {
+    markdown::to_html_with_options(markdown, &markdown::Options::gfm())
+        .unwrap_or_else(|_| markdown.to_owned())
+}
+
+fn notion_code_language(language: Option<&str>) -> &'static str {
+    let Some(language) = language else {
+        return "plain text";
+    };
+    match language.to_ascii_lowercase().as_str() {
+        "js" | "javascript" => "javascript",
+        "ts" | "typescript" => "typescript",
+        "python" | "py" => "python",
+        "rust" | "rs" => "rust",
+        "go" | "golang" => "go",
+        "c" => "c",
+        "cpp" | "c++" => "cpp",
+        "java" => "java",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "markdown" | "md" => "markdown",
+        "html" => "html",
+        "css" => "css",
+        "shell" | "sh" | "bash" | "zsh" => "bash",
+        "sql" => "sql",
+        "swift" => "swift",
+        "kotlin" => "kotlin",
+        "ruby" | "rb" => "ruby",
+        "php" => "php",
+        "dart" => "dart",
+        "xml" => "xml",
+        _ => "plain text",
+    }
+}
+
 fn block_to_notion(block: Block) -> Value {
     match block {
         Block::Heading { level, text } => json!({
@@ -184,17 +229,30 @@ fn block_to_notion(block: Block) -> Value {
             "type": "numbered_list_item",
             "numbered_list_item": { "rich_text": rich_text(&text) }
         }),
+        Block::Task { checked, text } => json!({
+            "object": "block",
+            "type": "to_do",
+            "to_do": { "rich_text": rich_text(&text), "checked": checked }
+        }),
         Block::Quote(text) => json!({
             "object": "block",
             "type": "quote",
             "quote": { "rich_text": rich_text(&text) }
         }),
-        Block::Code(text) => json!({
+        Block::Aside(text) => json!({
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": rich_text(&text),
+                "icon": { "type": "emoji", "emoji": "💡" }
+            }
+        }),
+        Block::Code { text, language } => json!({
             "object": "block",
             "type": "code",
             "code": {
                 "rich_text": rich_text(&text),
-                "language": "plain text"
+                "language": notion_code_language(language.as_deref())
             }
         }),
         Block::Image { url, .. } => json!({
@@ -233,6 +291,11 @@ fn block_to_notion(block: Block) -> Value {
             "type": "divider",
             "divider": {}
         }),
+        Block::Html(text) => json!({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": { "rich_text": rich_text(&text) }
+        }),
     }
 }
 
@@ -248,67 +311,21 @@ fn notion_table_row(cells: Vec<String>) -> Value {
 
 fn rich_text(text: &str) -> Vec<Value> {
     let mut result = Vec::new();
-    let mut offset = 0;
-    while offset < text.len() {
-        let rest = &text[offset..];
-        let Some((marker_offset, marker)) = next_inline_marker(rest) else {
-            push_rich_text(&mut result, rest, None, None);
-            break;
-        };
-        if marker_offset > 0 {
-            push_rich_text(&mut result, &rest[..marker_offset], None, None);
-            offset += marker_offset;
+    for piece in parse_inline(text) {
+        if piece.text.is_empty() {
             continue;
         }
-        if marker == "[" {
-            if let Some((label_end, url_end)) = linked_text_end(rest) {
-                let label = &rest[1..label_end];
-                let url = &rest[label_end + 2..url_end];
-                push_rich_text(&mut result, label, None, Some(url));
-                offset += url_end + 1;
-                continue;
-            }
-        } else if let Some(close_offset) = rest[marker.len()..].find(marker) {
-            let start = marker.len();
-            let end = start + close_offset;
-            let annotation = match marker {
-                "**" | "__" => Some("bold"),
-                "*" | "_" => Some("italic"),
-                "~~" => Some("strikethrough"),
-                CODE_MARKER => Some("code"),
-                _ => None,
-            };
-            if let Some(annotation) = annotation {
-                push_rich_text(&mut result, &rest[start..end], Some(annotation), None);
-                offset += end + marker.len();
-                continue;
-            }
-        }
-        push_rich_text(&mut result, marker, None, None);
-        offset += marker.len();
+        push_rich_text(
+            &mut result,
+            &piece.text,
+            &piece.styles,
+            piece.link.as_deref(),
+        );
     }
     result
 }
 
-fn next_inline_marker(text: &str) -> Option<(usize, &'static str)> {
-    ["**", "__", "~~", "*", "_", CODE_MARKER, "["]
-        .into_iter()
-        .filter_map(|marker| text.find(marker).map(|offset| (offset, marker)))
-        .min_by_key(|(offset, _)| *offset)
-}
-
-fn linked_text_end(text: &str) -> Option<(usize, usize)> {
-    let label_end = text.find("](")?;
-    let url_end = text[label_end + 2..].find(')')? + label_end + 2;
-    Some((label_end, url_end))
-}
-
-fn push_rich_text(
-    result: &mut Vec<Value>,
-    text: &str,
-    annotation: Option<&str>,
-    link: Option<&str>,
-) {
+fn push_rich_text(result: &mut Vec<Value>, text: &str, styles: &[InlineStyle], link: Option<&str>) {
     for chunk in text.chars().collect::<Vec<_>>().chunks(2000) {
         let content: String = chunk.iter().collect();
         let mut text_value = json!({ "content": content });
@@ -316,8 +333,14 @@ fn push_rich_text(
             text_value["link"] = json!({ "url": url });
         }
         let mut value = json!({ "type": "text", "text": text_value });
-        if let Some(annotation) = annotation {
-            value["annotations"] = json!({ annotation: true });
+        for style in styles {
+            let annotation = match style {
+                InlineStyle::Bold => "bold",
+                InlineStyle::Italic => "italic",
+                InlineStyle::Strike => "strikethrough",
+                InlineStyle::Code => "code",
+            };
+            value["annotations"][annotation] = json!(true);
         }
         result.push(value);
     }
@@ -378,7 +401,10 @@ fn extract_xml_value(response: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{document_title, metaweblog_new_post_xml, notion_blocks, xml_escape};
+    use super::{
+        document_title, local_image_count, markdown_to_html, metaweblog_new_post_xml,
+        notion_blocks, xml_escape,
+    };
 
     #[test]
     fn exports_notion_blocks_without_losing_ordered_list_semantics() {
@@ -386,6 +412,19 @@ mod tests {
         assert_eq!(blocks[0]["type"], "heading_1");
         assert_eq!(blocks[1]["type"], "numbered_list_item");
         assert_eq!(blocks[2]["type"], "quote");
+    }
+
+    #[test]
+    fn exports_gfm_tasks_and_notion_asides() {
+        let blocks = notion_blocks("- [ ] 待办\n- [x] 已完成\n\n<aside>提示</aside>").unwrap();
+        assert_eq!(blocks[0]["type"], "to_do");
+        assert_eq!(blocks[0]["to_do"]["checked"], false);
+        assert_eq!(blocks[1]["to_do"]["checked"], true);
+        assert_eq!(blocks[2]["type"], "callout");
+        assert_eq!(
+            blocks[2]["callout"]["rich_text"][0]["text"]["content"],
+            "提示"
+        );
     }
 
     #[test]
@@ -419,6 +458,32 @@ mod tests {
             blocks[2]["children"][1]["table_row"]["cells"][0][0]["text"]["content"],
             "一"
         );
+    }
+
+    #[test]
+    fn converts_markdown_to_html_for_typecho() {
+        let html = markdown_to_html("# 标题\n\n- 一\n- 二");
+        assert!(html.contains("<h1>标题</h1>"));
+        assert!(html.contains("<li>一</li>"));
+    }
+
+    #[test]
+    fn counts_local_image_links() {
+        assert_eq!(
+            local_image_count("![a](file:///C:/x.png) [b](https://e.com)"),
+            1
+        );
+        assert_eq!(local_image_count("no local images"), 0);
+    }
+
+    #[test]
+    fn exports_code_language_for_notion() {
+        let blocks = notion_blocks("```rust\nfn main() {}\n```").unwrap();
+        assert_eq!(blocks[0]["code"]["language"], "rust");
+        let blocks = notion_blocks("```\nplain\n```").unwrap();
+        assert_eq!(blocks[0]["code"]["language"], "plain text");
+        let blocks = notion_blocks("```UnknownLang\nx\n```").unwrap();
+        assert_eq!(blocks[0]["code"]["language"], "plain text");
     }
 
     #[test]

@@ -19,7 +19,8 @@ PowerShell users can run `./build.ps1` for a release build.
 
 - Ribbon-style editor with Markdown editing, preview, undo/redo, and clipboard;
 - Chinese IME marked text, UTF-16 text ranges, and logical-pixel HiDPI layout;
-- UTF-8 Markdown open/save and local draft recovery;
+- UTF-8/UTF-16/GBK Markdown open/save with newline/BOM preservation, local drafts,
+  and crash-safe autosave recovery;
 - Markdown preview for headings, lists, quotes, code, images, video, tables,
   inline formatting, and dividers;
 - optional Notion page creation and Typecho MetaWeblog publishing;

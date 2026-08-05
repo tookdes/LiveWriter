@@ -3897,13 +3897,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "embed-resource",
+ "encoding_rs",
  "futures",
  "gpui",
  "gpui-component",
+ "markdown",
  "rust-embed",
  "serde",
  "serde_json",
- "unicode-segmentation",
 ]
 
 [[package]]
