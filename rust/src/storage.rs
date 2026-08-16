@@ -1,4 +1,8 @@
-use std::{env, fs, io, path::PathBuf};
+use std::{
+    env, fs, io,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 fn app_data_dir() -> PathBuf {
     if cfg!(target_os = "windows")
@@ -33,12 +37,64 @@ pub fn autosave_path() -> PathBuf {
     app_data_dir().join("autosave.md")
 }
 
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// 原子写入：先写同目录临时文件，再 rename 覆盖目标，
+/// 避免写入途中崩溃把原文件写坏。
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "目标路径无效"))?;
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut temp_name = std::ffi::OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(format!(".{}.{}.tmp", std::process::id(), counter));
+    let temp_path = parent.join(temp_name);
+
+    if let Err(error) = fs::write(&temp_path, bytes) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    match fs::rename(&temp_path, path) {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            // Windows 上目标已存在时 rename 可能失败；
+            // 确认是“已存在”类错误后再替换。
+            let can_replace = cfg!(windows)
+                && matches!(
+                    first_error.kind(),
+                    io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
+                );
+            let result = if can_replace {
+                let removed = match fs::remove_file(path) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                    Err(_) => false,
+                };
+                if removed {
+                    fs::rename(&temp_path, path)
+                } else {
+                    Err(first_error)
+                }
+            } else {
+                Err(first_error)
+            };
+            if result.is_err() {
+                let _ = fs::remove_file(&temp_path);
+            }
+            result
+        }
+    }
+}
+
 pub fn save_draft(content: &str) -> io::Result<PathBuf> {
     let path = draft_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, content)?;
+    atomic_write(&path, content.as_bytes())?;
     Ok(path)
 }
 
@@ -56,7 +112,7 @@ pub fn save_autosave(content: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, content)
+    atomic_write(&path, content.as_bytes())
 }
 
 pub fn load_autosave() -> io::Result<Option<String>> {

@@ -281,18 +281,8 @@ impl MarkdownInput {
 
             let (new_line, cursor_delta) = if prefix == "# " {
                 toggle_heading_line(line_text, cursor.saturating_sub(line_start))
-            } else if let Some(rest) = line_text.strip_prefix(&prefix) {
-                (
-                    rest.to_owned(),
-                    cursor
-                        .saturating_sub(line_start)
-                        .saturating_sub(prefix.len()),
-                )
             } else {
-                (
-                    format!("{prefix}{line_text}"),
-                    cursor.saturating_sub(line_start) + prefix.len(),
-                )
+                toggle_block_prefix(line_text, &prefix, cursor.saturating_sub(line_start))
             };
 
             let range_utf16 = utf16_range_from_utf8(&full, line_start..line_end);
@@ -368,6 +358,58 @@ fn toggle_heading_line(line: &str, cursor_offset: usize) -> (String, usize) {
     }
 }
 
+/// 切换“列表 / 引用”类行前缀：已有相同前缀则移除，已有其他前缀则替换，
+/// 避免叠出 `- [ ] - xxx`、`- > xxx` 这类错误 Markdown。
+fn toggle_block_prefix(line: &str, prefix: &str, cursor_offset: usize) -> (String, usize) {
+    if let Some(rest) = exact_prefix_rest(line, prefix) {
+        return (rest.to_owned(), cursor_offset.saturating_sub(prefix.len()));
+    }
+
+    let (rest, removed) = strip_block_prefix(line);
+    let new_line = format!("{prefix}{rest}");
+    let cursor_delta = if cursor_offset <= removed {
+        prefix.len().min(new_line.len())
+    } else {
+        prefix.len() + (cursor_offset - removed)
+    };
+    (new_line, cursor_delta)
+}
+
+/// 仅当行的前缀与请求前缀完全一致时，返回去掉前缀后的剩余文本。
+/// `- ` 不能吞掉 `- [ ] ` / `- [x] ` 的任务标记。
+fn exact_prefix_rest<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(prefix)?;
+    if prefix == "- "
+        && (rest.starts_with("[ ] ") || rest.starts_with("[x] ") || rest.starts_with("[X] "))
+    {
+        return None;
+    }
+    Some(rest)
+}
+
+/// 去掉一层常见块前缀（任务、无序、有序、引用），返回剩余文本与移除的字节数。
+fn strip_block_prefix(line: &str) -> (&str, usize) {
+    for prefix in ["- [ ] ", "- [x] ", "- [X] ", "- ", "* ", "+ ", "> "] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            return (rest, prefix.len());
+        }
+    }
+    // 有序列表：数字后跟 ". " 或 ") "。
+    let bytes = line.as_bytes();
+    let mut digits = 0;
+    while digits < bytes.len() && bytes[digits].is_ascii_digit() {
+        digits += 1;
+    }
+    if digits > 0
+        && let Some(rest) = line[digits..]
+            .strip_prefix(". ")
+            .or_else(|| line[digits..].strip_prefix(") "))
+    {
+        return (rest, digits + 2);
+    }
+    (line, 0)
+}
+
 impl Focusable for MarkdownInput {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.state.read(cx).focus_handle(cx)
@@ -395,6 +437,7 @@ struct MarkdownEditor {
     close_confirmed: bool,
     line_ending: String,
     file_encoding: FileEncoding,
+    last_draft_content: Option<String>,
     last_window_title: String,
     _content_subscription: gpui::Subscription,
 }
@@ -480,6 +523,7 @@ impl MarkdownEditor {
             close_confirmed: false,
             line_ending: "\n".to_owned(),
             file_encoding: FileEncoding::Utf8,
+            last_draft_content: None,
             last_window_title: "Open Live Writer".to_owned(),
             publish_settings,
             _content_subscription: subscription,
@@ -499,6 +543,10 @@ impl MarkdownEditor {
                 let _ = editor.update(cx, |editor, cx| {
                     if editor.dirty {
                         let content = editor.content(cx);
+                        // 内容与最近一次草稿一致时无需重复备份。
+                        if editor.last_draft_content.as_deref() == Some(content.as_str()) {
+                            return;
+                        }
                         if let Err(error) = storage::save_autosave(&content) {
                             eprintln!("自动备份失败：{error}");
                         }
@@ -621,6 +669,7 @@ impl MarkdownEditor {
         self.path = path;
         self.dirty = false;
         self.close_confirmed = false;
+        self.last_draft_content = None;
         self.status = "已加载 · Markdown".into();
         let _ = storage::clear_autosave();
         cx.notify();
@@ -660,9 +709,11 @@ impl MarkdownEditor {
     }
 
     fn save_draft(&mut self, _: &SaveDraft, _window: &mut Window, cx: &mut Context<Self>) {
-        match storage::save_draft(&self.content(cx)) {
+        let content = self.content(cx);
+        match storage::save_draft(&content) {
             Ok(path) => {
                 let _ = storage::clear_autosave();
+                self.last_draft_content = Some(content);
                 self.status =
                     format!("草稿已保存 · {} · 尚未保存为文件", display_path(&path)).into()
             }
@@ -830,7 +881,7 @@ impl MarkdownEditor {
                 return false;
             }
         };
-        match fs::write(&path, bytes) {
+        match storage::atomic_write(&path, &bytes) {
             Ok(()) => {
                 self.path = Some(path.clone());
                 self.dirty = false;
@@ -971,7 +1022,7 @@ impl MarkdownEditor {
     fn publish_to_notion(
         &mut self,
         _: &PublishToNotion,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let markdown = self.content(cx);
@@ -981,17 +1032,44 @@ impl MarkdownEditor {
             NotionConfig::from_env().or_else(|| self.publish_settings.notion_config())
         {
             let http = cx.http_client();
+            let window_handle = window.window_handle();
             self.status = format!("正在发布到 Notion…{warning}").into();
             cx.notify();
             cx.spawn(async move |editor, cx| {
-                let result = publish_notion_request(http, config, &title, &markdown).await;
-                let _ = editor.update(cx, |editor, cx| {
-                    editor.status = match result {
-                        Ok(_) => format!("已发布到 Notion{warning}").into(),
-                        Err(error) => format!("Notion 发布失败：{error}").into(),
-                    };
-                    cx.notify();
-                });
+                match publish_notion_request(http, config, &title, &markdown).await {
+                    Ok(page_id) => {
+                        let url = format!("https://www.notion.so/{page_id}");
+                        let _ = cx.update(|app| app.open_url(&url));
+                        let _ = cx.update(|app| {
+                            app.write_to_clipboard(ClipboardItem::new_string(url.clone()))
+                        });
+                        let _ = editor.update(cx, |editor, cx| {
+                            editor.status =
+                                format!("已发布到 Notion{warning} · 链接已复制：{url}").into();
+                            cx.notify();
+                        });
+                    }
+                    Err(error) => {
+                        let message = format!("Notion 发布失败：{error}");
+                        let _ = window_handle.update(cx, |_, window, cx| {
+                            let answer = window.prompt(
+                                PromptLevel::Warning,
+                                "发布失败",
+                                Some(&message),
+                                &["确定"],
+                                cx,
+                            );
+                            cx.spawn(async move |_| {
+                                let _ = answer.await;
+                            })
+                            .detach();
+                        });
+                        let _ = editor.update(cx, |editor, cx| {
+                            editor.status = message.into();
+                            cx.notify();
+                        });
+                    }
+                }
             })
             .detach();
         } else {
@@ -1013,7 +1091,7 @@ impl MarkdownEditor {
     fn publish_to_typecho(
         &mut self,
         _: &PublishToTypecho,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let markdown = self.content(cx);
@@ -1023,17 +1101,39 @@ impl MarkdownEditor {
             TypechoConfig::from_env().or_else(|| self.publish_settings.typecho_config())
         {
             let http = cx.http_client();
+            let window_handle = window.window_handle();
             self.status = format!("正在发布到 Typecho…{warning}").into();
             cx.notify();
             cx.spawn(async move |editor, cx| {
-                let result = publish_typecho_request(http, config, &title, &markdown).await;
-                let _ = editor.update(cx, |editor, cx| {
-                    editor.status = match result {
-                        Ok(_) => format!("已提交到 Typecho{warning}").into(),
-                        Err(error) => format!("Typecho 发布失败：{error}").into(),
-                    };
-                    cx.notify();
-                });
+                match publish_typecho_request(http, config, &title, &markdown).await {
+                    Ok(post_id) => {
+                        let _ = editor.update(cx, |editor, cx| {
+                            editor.status =
+                                format!("已提交到 Typecho{warning} · 文章 ID：{post_id}").into();
+                            cx.notify();
+                        });
+                    }
+                    Err(error) => {
+                        let message = format!("Typecho 发布失败：{error}");
+                        let _ = window_handle.update(cx, |_, window, cx| {
+                            let answer = window.prompt(
+                                PromptLevel::Warning,
+                                "发布失败",
+                                Some(&message),
+                                &["确定"],
+                                cx,
+                            );
+                            cx.spawn(async move |_| {
+                                let _ = answer.await;
+                            })
+                            .detach();
+                        });
+                        let _ = editor.update(cx, |editor, cx| {
+                            editor.status = message.into();
+                            cx.notify();
+                        });
+                    }
+                }
             })
             .detach();
         } else {

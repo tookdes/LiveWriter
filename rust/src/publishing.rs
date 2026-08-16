@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
+use futures::future::{Either, select};
 use futures::io::AsyncReadExt;
+use gpui::Timer;
 use gpui::http_client::{AsyncBody, HttpClient, Method, Request};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -11,6 +13,22 @@ use crate::markdown::{Block, InlineStyle, parse_blocks, parse_inline, strip_inli
 const NOTION_VERSION: &str = "2022-06-28";
 pub const CREDENTIALS_URL: &str = "open-live-writer://publishing";
 pub const CREDENTIALS_USERNAME: &str = "open-live-writer";
+
+const REQUEST_TIMEOUT_SECONDS: u64 = 30;
+
+/// 给发布请求加超时，避免服务端无响应时永久挂起。
+async fn request_with_timeout<T, F>(future: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let timer = async {
+        Timer::after(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS)).await;
+    };
+    match select(Box::pin(future), Box::pin(timer)).await {
+        Either::Left((result, _)) => result,
+        Either::Right(_) => bail!("发布请求超时（{REQUEST_TIMEOUT_SECONDS} 秒无响应），请稍后重试"),
+    }
+}
 
 fn env_var_trimmed(name: &str) -> Option<String> {
     let value = std::env::var(name).ok()?;
@@ -110,9 +128,13 @@ pub async fn publish_to_notion(
         .header("Notion-Version", NOTION_VERSION)
         .header("Content-Type", "application/json")
         .body(AsyncBody::from(serde_json::to_vec(&payload)?))?;
-    let mut response = http.send(request).await?;
-    let status = response.status();
-    let body = read_body(&mut response).await?;
+    let (status, body) = request_with_timeout(async {
+        let mut response = http.send(request).await?;
+        let status = response.status();
+        let body = read_body(&mut response).await?;
+        Ok::<_, anyhow::Error>((status, body))
+    })
+    .await?;
     if !status.is_success() {
         bail!(
             "Notion 返回 HTTP {}：{}",
@@ -144,9 +166,13 @@ pub async fn publish_to_typecho(
         .uri(&config.xmlrpc_url)
         .header("Content-Type", "text/xml; charset=utf-8")
         .body(AsyncBody::from(body.into_bytes()))?;
-    let mut response = http.send(request).await?;
-    let status = response.status();
-    let body = read_body(&mut response).await?;
+    let (status, body) = request_with_timeout(async {
+        let mut response = http.send(request).await?;
+        let status = response.status();
+        let body = read_body(&mut response).await?;
+        Ok::<_, anyhow::Error>((status, body))
+    })
+    .await?;
     let text = String::from_utf8_lossy(&body);
     if !status.is_success() {
         bail!("Typecho 返回 HTTP {}：{}", status.as_u16(), text.trim());
