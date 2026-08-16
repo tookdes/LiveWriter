@@ -50,6 +50,33 @@ const TEXT: u32 = 0x263746;
 const MUTED: u32 = 0x617285;
 const INLINE_CODE_MARKER: &str = "\x60";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileEncoding {
+    Utf8,
+    Utf8Bom,
+    Utf16Le,
+    Utf16Be,
+    Gbk,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedDocument {
+    content: String,
+    line_ending: String,
+    encoding: FileEncoding,
+}
+
+impl LoadedDocument {
+    fn new(content: String, encoding: FileEncoding) -> Self {
+        let (content, line_ending) = prepare_content(content);
+        Self {
+            content,
+            line_ending,
+            encoding,
+        }
+    }
+}
+
 fn typecho_is_primary_publish_target(notion_configured: bool, typecho_configured: bool) -> bool {
     typecho_configured && !notion_configured
 }
@@ -245,6 +272,7 @@ impl MarkdownInput {
         state.update(cx, |state, cx| {
             let full = state.text().to_string();
             let starts = line_starts(&full);
+            let cursor = state.cursor();
             let line = state.text().offset_to_position(state.cursor()).line as usize;
             let line = line.min(starts.len().saturating_sub(1));
             let line_start = starts[line];
@@ -252,11 +280,19 @@ impl MarkdownInput {
             let line_text = &full[line_start..line_end];
 
             let (new_line, cursor_delta) = if prefix == "# " {
-                toggle_heading_line(line_text)
+                toggle_heading_line(line_text, cursor.saturating_sub(line_start))
             } else if let Some(rest) = line_text.strip_prefix(&prefix) {
-                (rest.to_owned(), 0)
+                (
+                    rest.to_owned(),
+                    cursor
+                        .saturating_sub(line_start)
+                        .saturating_sub(prefix.len()),
+                )
             } else {
-                (format!("{prefix}{line_text}"), prefix.len())
+                (
+                    format!("{prefix}{line_text}"),
+                    cursor.saturating_sub(line_start) + prefix.len(),
+                )
             };
 
             let range_utf16 = utf16_range_from_utf8(&full, line_start..line_end);
@@ -313,14 +349,22 @@ fn subscribe_input_state(
     )
 }
 
-fn toggle_heading_line(line: &str) -> (String, usize) {
-    if line.starts_with("# ") {
-        (line.trim_start_matches('#').trim_start().to_owned(), 0)
+fn toggle_heading_line(line: &str, cursor_offset: usize) -> (String, usize) {
+    if let Some(rest) = line.strip_prefix("# ") {
+        let removed = line.len().saturating_sub(rest.len());
+        (rest.to_owned(), cursor_offset.saturating_sub(removed))
     } else if line.starts_with('#') {
         let rest = line.trim_start_matches('#').trim_start();
-        (format!("# {rest}"), 2)
+        let title_offset = line.len().saturating_sub(rest.len());
+        let new_line = format!("# {rest}");
+        let cursor = if cursor_offset <= title_offset {
+            2.min(new_line.len())
+        } else {
+            2 + cursor_offset.saturating_sub(title_offset)
+        };
+        (new_line, cursor)
     } else {
-        (format!("# {line}"), 2)
+        (format!("# {line}"), cursor_offset + 2)
     }
 }
 
@@ -350,7 +394,7 @@ struct MarkdownEditor {
     suppress_observer: bool,
     close_confirmed: bool,
     line_ending: String,
-    utf8_bom: bool,
+    file_encoding: FileEncoding,
     last_window_title: String,
     _content_subscription: gpui::Subscription,
 }
@@ -435,7 +479,7 @@ impl MarkdownEditor {
             suppress_observer: false,
             close_confirmed: false,
             line_ending: "\n".to_owned(),
-            utf8_bom: false,
+            file_encoding: FileEncoding::Utf8,
             last_window_title: "Open Live Writer".to_owned(),
             publish_settings,
             _content_subscription: subscription,
@@ -476,7 +520,10 @@ impl MarkdownEditor {
             (&self.typecho_password_input, settings.typecho_password),
         ];
         for (input, value) in values {
-            input.update(cx, |input, cx| input.set_content(value, cx));
+            let is_empty = input.read(cx).content.is_empty();
+            if is_empty && !value.is_empty() {
+                input.update(cx, |input, cx| input.set_content(value, cx));
+            }
         }
         cx.notify();
     }
@@ -493,7 +540,13 @@ impl MarkdownEditor {
     ) {
         self.settings_visible = !self.settings_visible;
         self.status = if self.settings_visible {
-            "发布设置 · 凭据使用系统安全存储".into()
+            "发布设置 · 环境变量优先，凭据保存在系统安全存储".into()
+        } else if self.preview {
+            if self.dirty {
+                "预览模式 · 尚未保存".into()
+            } else {
+                "预览模式 · Markdown 已渲染".into()
+            }
         } else if self.dirty {
             "正在编辑 · 尚未保存".into()
         } else {
@@ -509,10 +562,15 @@ impl MarkdownEditor {
         cx: &mut Context<Self>,
     ) {
         let settings = StoredPublishSettings {
-            notion_token: self.notion_token_input.read(cx).content.to_string(),
-            notion_parent_page_id: self.notion_parent_input.read(cx).content.to_string(),
-            typecho_xmlrpc_url: self.typecho_url_input.read(cx).content.to_string(),
-            typecho_username: self.typecho_username_input.read(cx).content.to_string(),
+            notion_token: self.notion_token_input.read(cx).content.trim().to_owned(),
+            notion_parent_page_id: self.notion_parent_input.read(cx).content.trim().to_owned(),
+            typecho_xmlrpc_url: self.typecho_url_input.read(cx).content.trim().to_owned(),
+            typecho_username: self
+                .typecho_username_input
+                .read(cx)
+                .content
+                .trim()
+                .to_owned(),
             typecho_password: self.typecho_password_input.read(cx).content.to_string(),
         };
         let Ok(bytes) = serde_json::to_vec(&settings) else {
@@ -541,8 +599,17 @@ impl MarkdownEditor {
         .detach();
     }
 
-    fn replace_document(&mut self, path: Option<PathBuf>, content: String, cx: &mut Context<Self>) {
-        let (content, line_ending, utf8_bom) = prepare_content(content);
+    fn replace_document(
+        &mut self,
+        path: Option<PathBuf>,
+        document: LoadedDocument,
+        cx: &mut Context<Self>,
+    ) {
+        let LoadedDocument {
+            content,
+            line_ending,
+            encoding,
+        } = document;
         self.suppress_observer = true;
         self.text_input.update(cx, |input, cx| {
             input.set_document_content(content.clone(), cx)
@@ -550,7 +617,7 @@ impl MarkdownEditor {
         self.suppress_observer = false;
         self.last_observed_content = content;
         self.line_ending = line_ending;
-        self.utf8_bom = utf8_bom;
+        self.file_encoding = encoding;
         self.path = path;
         self.dirty = false;
         self.close_confirmed = false;
@@ -560,7 +627,7 @@ impl MarkdownEditor {
     }
 
     fn restore_autosave(&mut self, content: String, cx: &mut Context<Self>) {
-        self.replace_document(None, content, cx);
+        self.replace_document(None, LoadedDocument::new(content, FileEncoding::Utf8), cx);
         self.dirty = true;
         self.status = "已恢复自动备份 · 尚未保存".into();
         cx.notify();
@@ -575,7 +642,11 @@ impl MarkdownEditor {
     }
 
     fn new_document_now(&mut self, cx: &mut Context<Self>) {
-        self.replace_document(None, "# 未命名文章\n\n".to_owned(), cx);
+        self.replace_document(
+            None,
+            LoadedDocument::new("# 未命名文章\n\n".to_owned(), FileEncoding::Utf8),
+            cx,
+        );
         self.status = "新文章 · 尚未保存".into();
     }
 
@@ -590,7 +661,11 @@ impl MarkdownEditor {
 
     fn save_draft(&mut self, _: &SaveDraft, _window: &mut Window, cx: &mut Context<Self>) {
         match storage::save_draft(&self.content(cx)) {
-            Ok(path) => self.status = format!("草稿已保存 · {}", display_path(&path)).into(),
+            Ok(path) => {
+                let _ = storage::clear_autosave();
+                self.status =
+                    format!("草稿已保存 · {} · 尚未保存为文件", display_path(&path)).into()
+            }
             Err(error) => self.status = format!("草稿保存失败：{error}").into(),
         }
         cx.notify();
@@ -616,7 +691,7 @@ impl MarkdownEditor {
     fn open_draft_now(&mut self, cx: &mut Context<Self>) {
         match storage::load_draft() {
             Ok(Some((path, content))) => {
-                self.replace_document(None, content, cx);
+                self.replace_document(None, LoadedDocument::new(content, FileEncoding::Utf8), cx);
                 self.status = format!("已打开草稿 · {}", display_path(&path)).into();
             }
             Ok(None) => self.status = "暂无本地草稿".into(),
@@ -652,8 +727,9 @@ impl MarkdownEditor {
             Some(0) => {
                 if let Some(path) = current_path {
                     let _ = editor.update(cx, |editor, cx| {
-                        editor.save_to(path, cx);
-                        editor.continue_pending(operation, cx);
+                        if editor.save_to(path, cx) {
+                            editor.continue_pending(operation, cx);
+                        }
                     });
                     return;
                 }
@@ -666,8 +742,9 @@ impl MarkdownEditor {
                     return;
                 };
                 let _ = editor.update(cx, |editor, cx| {
-                    editor.save_to(path, cx);
-                    editor.continue_pending(operation, cx);
+                    if editor.save_to(path, cx) {
+                        editor.continue_pending(operation, cx);
+                    }
                 });
             }
             Some(1) => {
@@ -710,9 +787,9 @@ impl MarkdownEditor {
             };
             match fs::read(&path) {
                 Ok(bytes) => match decode_markdown(&bytes) {
-                    Ok(content) => {
+                    Ok(document) => {
                         let _ = editor.update(cx, |editor, cx| {
-                            editor.replace_document(Some(path), content, cx);
+                            editor.replace_document(Some(path), document, cx);
                         });
                     }
                     Err(message) => {
@@ -742,22 +819,33 @@ impl MarkdownEditor {
         self.open_document(&OpenDocument, window, cx);
     }
 
-    fn save_to(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let mut content = self.content(cx).replace('\n', &self.line_ending);
-        if self.utf8_bom {
-            content.insert(0, '\u{feff}');
-        }
-        match fs::write(&path, content) {
+    fn save_to(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
+        let editor_content = self.content(cx);
+        let disk_content = editor_content.replace('\n', &self.line_ending);
+        let bytes = match encode_markdown(&disk_content, self.file_encoding) {
+            Ok(bytes) => bytes,
+            Err(message) => {
+                self.status = message.into();
+                cx.notify();
+                return false;
+            }
+        };
+        match fs::write(&path, bytes) {
             Ok(()) => {
                 self.path = Some(path.clone());
                 self.dirty = false;
-                self.last_observed_content = self.content(cx);
+                self.last_observed_content = editor_content;
                 self.status = format!("已保存 · {}", display_path(&path)).into();
                 let _ = storage::clear_autosave();
+                cx.notify();
+                true
             }
-            Err(error) => self.status = format!("保存失败：{error}").into(),
+            Err(error) => {
+                self.status = format!("保存失败：{error}").into();
+                cx.notify();
+                false
+            }
         }
-        cx.notify();
     }
 
     fn save_document(&mut self, _: &SaveDocument, _window: &mut Window, cx: &mut Context<Self>) {
@@ -787,9 +875,17 @@ impl MarkdownEditor {
     fn toggle_preview(&mut self, _: &TogglePreview, _window: &mut Window, cx: &mut Context<Self>) {
         self.preview = !self.preview;
         self.status = if self.preview {
-            "预览模式 · Markdown 已渲染".into()
+            if self.dirty {
+                "预览模式 · 尚未保存".into()
+            } else {
+                "预览模式 · Markdown 已渲染".into()
+            }
         } else {
-            "编辑模式 · Markdown 源文".into()
+            if self.dirty {
+                "编辑模式 · 尚未保存".into()
+            } else {
+                "编辑模式 · Markdown 源文".into()
+            }
         };
         cx.notify();
     }
@@ -824,12 +920,18 @@ impl MarkdownEditor {
         cx.spawn(async move |editor, cx| match answer.await.ok() {
             Some(0) => {
                 if let Some(path) = current_path {
-                    let _ = editor.update(cx, |editor, cx| {
-                        editor.save_to(path, cx);
-                        editor.close_confirmed = true;
-                        cx.notify();
+                    let saved = editor.update(cx, |editor, cx| {
+                        if editor.save_to(path, cx) {
+                            editor.close_confirmed = true;
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
                     });
-                    let _ = cx.update(|app| app.quit());
+                    if saved.unwrap_or(false) {
+                        let _ = cx.update(|app| app.quit());
+                    }
                     return;
                 }
                 let Ok(receiver) = cx.update(|app| {
@@ -840,16 +942,23 @@ impl MarkdownEditor {
                 let Ok(Ok(Some(path))) = receiver.await else {
                     return;
                 };
-                let _ = editor.update(cx, |editor, cx| {
-                    editor.save_to(path, cx);
-                    editor.close_confirmed = true;
-                    cx.notify();
+                let saved = editor.update(cx, |editor, cx| {
+                    if editor.save_to(path, cx) {
+                        editor.close_confirmed = true;
+                        cx.notify();
+                        true
+                    } else {
+                        false
+                    }
                 });
-                let _ = cx.update(|app| app.quit());
+                if saved.unwrap_or(false) {
+                    let _ = cx.update(|app| app.quit());
+                }
             }
             Some(1) => {
                 let _ = editor.update(cx, |editor, cx| {
                     editor.close_confirmed = true;
+                    let _ = storage::clear_autosave();
                     cx.notify();
                 });
                 let _ = cx.update(|app| app.quit());
@@ -1888,45 +1997,86 @@ fn normalize_newlines(content: String) -> String {
     content.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn prepare_content(content: String) -> (String, String, bool) {
-    let utf8_bom = content.starts_with('\u{feff}');
-    let content = if utf8_bom {
-        content.trim_start_matches('\u{feff}').to_owned()
-    } else {
-        content
-    };
+fn prepare_content(content: String) -> (String, String) {
     let line_ending = if content.contains("\r\n") {
         "\r\n".to_owned()
+    } else if content.contains('\r') {
+        "\r".to_owned()
     } else {
         "\n".to_owned()
     };
-    (normalize_newlines(content), line_ending, utf8_bom)
+    (normalize_newlines(content), line_ending)
 }
 
-fn decode_markdown(bytes: &[u8]) -> Result<String, String> {
+fn decode_markdown(bytes: &[u8]) -> Result<LoadedDocument, String> {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        return String::from_utf8(bytes[3..].to_vec())
-            .map_err(|error| format!("UTF-8 解码失败：{error}"));
+        let content = String::from_utf8(bytes[3..].to_vec())
+            .map_err(|error| format!("UTF-8 解码失败：{error}"))?;
+        return Ok(LoadedDocument::new(content, FileEncoding::Utf8Bom));
     }
     if bytes.starts_with(&[0xFF, 0xFE]) {
-        let units = bytes[2..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>();
-        return Ok(String::from_utf16_lossy(&units));
+        let content = decode_utf16_bytes(&bytes[2..], true)?;
+        return Ok(LoadedDocument::new(content, FileEncoding::Utf16Le));
     }
     if bytes.starts_with(&[0xFE, 0xFF]) {
-        let units = bytes[2..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>();
-        return Ok(String::from_utf16_lossy(&units));
+        let content = decode_utf16_bytes(&bytes[2..], false)?;
+        return Ok(LoadedDocument::new(content, FileEncoding::Utf16Be));
     }
     if let Ok(text) = std::str::from_utf8(bytes) {
-        return Ok(text.to_owned());
+        return Ok(LoadedDocument::new(text.to_owned(), FileEncoding::Utf8));
     }
     let (decoded, _, _) = encoding_rs::GBK.decode(bytes);
-    Ok(decoded.into_owned())
+    Ok(LoadedDocument::new(decoded.into_owned(), FileEncoding::Gbk))
+}
+
+fn decode_utf16_bytes(bytes: &[u8], little_endian: bool) -> Result<String, String> {
+    if bytes.len() % 2 != 0 {
+        return Err("UTF-16 文件损坏：字节长度不是偶数".to_owned());
+    }
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| {
+            if little_endian {
+                u16::from_le_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).map_err(|error| format!("UTF-16 解码失败：{error}"))
+}
+
+fn encode_markdown(content: &str, encoding: FileEncoding) -> Result<Vec<u8>, String> {
+    match encoding {
+        FileEncoding::Utf8 => Ok(content.as_bytes().to_vec()),
+        FileEncoding::Utf8Bom => {
+            let mut bytes = vec![0xEF, 0xBB, 0xBF];
+            bytes.extend_from_slice(content.as_bytes());
+            Ok(bytes)
+        }
+        FileEncoding::Utf16Le => {
+            let mut bytes = vec![0xFF, 0xFE];
+            for unit in content.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            Ok(bytes)
+        }
+        FileEncoding::Utf16Be => {
+            let mut bytes = vec![0xFE, 0xFF];
+            for unit in content.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_be_bytes());
+            }
+            Ok(bytes)
+        }
+        FileEncoding::Gbk => {
+            let (encoded, _, had_errors) = encoding_rs::GBK.encode(content);
+            if had_errors {
+                Err("保存失败：当前内容包含 GBK 无法表示的字符".to_owned())
+            } else {
+                Ok(encoded.into_owned())
+            }
+        }
+    }
 }
 
 fn default_save_directory() -> PathBuf {
@@ -1952,7 +2102,7 @@ fn default_save_directory() -> PathBuf {
 fn local_image_warning(markdown: &str) -> String {
     let count = local_image_count(markdown);
     if count > 0 {
-        format!("（含 {count} 处本地图片，发布后可能无法显示）")
+        format!("（含 {count} 处本地/相对图片，发布后可能无法直接显示）")
     } else {
         String::new()
     }
@@ -2212,11 +2362,12 @@ fn settings_panel(
                 .child("发布设置"),
         )
         .child(div().text_sm().text_color(rgb(MUTED)).child(
-            "配置后，发布按钮会直接调用服务；凭据仅保存到系统安全存储。未配置时仍可复制 Markdown。",
+            "配置后，发布按钮会直接调用服务；环境变量优先于这里保存的设置，凭据仅保存到系统安全存储。未配置时仍可复制 Markdown。",
         ))
         .child(
             div()
                 .flex()
+                .flex_wrap()
                 .gap_4()
                 .w_full()
                 .child(
@@ -2224,6 +2375,7 @@ fn settings_panel(
                         .flex()
                         .flex_col()
                         .flex_grow()
+                        .min_w(px(320.))
                         .gap_3()
                         .p_4()
                         .bg(white())
@@ -2252,6 +2404,7 @@ fn settings_panel(
                         .flex()
                         .flex_col()
                         .flex_grow()
+                        .min_w(px(320.))
                         .gap_3()
                         .p_4()
                         .bg(white())
@@ -2551,7 +2704,18 @@ fn ribbon_icon(path: &'static str) -> Img {
 }
 
 fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
-    parse_blocks(markdown)
+    let blocks = parse_blocks(markdown);
+    if blocks.is_empty() {
+        return vec![
+            div()
+                .w_full()
+                .p_4()
+                .text_color(rgb(MUTED))
+                .child("开始输入 Markdown，这里会显示预览。")
+                .into_any_element(),
+        ];
+    }
+    blocks
         .into_iter()
         .enumerate()
         .map(|(index, block)| match block {
@@ -2925,12 +3089,18 @@ fn main() {
                         .spawn(cx, async move |cx| match answer.await.ok() {
                             Some(0) => {
                                 if let Some(path) = path.clone() {
-                                    let _ = editor_for_prompt.update(cx, |editor, cx| {
-                                        editor.save_to(path, cx);
-                                        editor.close_confirmed = true;
-                                        cx.notify();
+                                    let saved = editor_for_prompt.update(cx, |editor, cx| {
+                                        if editor.save_to(path, cx) {
+                                            editor.close_confirmed = true;
+                                            cx.notify();
+                                            true
+                                        } else {
+                                            false
+                                        }
                                     });
-                                    let _ = cx.update(|window, _| window.remove_window());
+                                    if saved.unwrap_or(false) {
+                                        let _ = cx.update(|window, _| window.remove_window());
+                                    }
                                     return;
                                 }
                                 let Ok(receiver) = cx.update(|_, cx| {
@@ -2944,16 +3114,23 @@ fn main() {
                                 let Ok(Ok(Some(path))) = receiver.await else {
                                     return;
                                 };
-                                let _ = editor_for_prompt.update(cx, |editor, cx| {
-                                    editor.save_to(path, cx);
-                                    editor.close_confirmed = true;
-                                    cx.notify();
+                                let saved = editor_for_prompt.update(cx, |editor, cx| {
+                                    if editor.save_to(path, cx) {
+                                        editor.close_confirmed = true;
+                                        cx.notify();
+                                        true
+                                    } else {
+                                        false
+                                    }
                                 });
-                                let _ = cx.update(|window, _| window.remove_window());
+                                if saved.unwrap_or(false) {
+                                    let _ = cx.update(|window, _| window.remove_window());
+                                }
                             }
                             Some(1) => {
                                 let _ = editor_for_prompt.update(cx, |editor, cx| {
                                     editor.close_confirmed = true;
+                                    let _ = storage::clear_autosave();
                                     cx.notify();
                                 });
                                 let _ = cx.update(|window, _| window.remove_window());

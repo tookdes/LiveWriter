@@ -12,6 +12,12 @@ const NOTION_VERSION: &str = "2022-06-28";
 pub const CREDENTIALS_URL: &str = "open-live-writer://publishing";
 pub const CREDENTIALS_USERNAME: &str = "open-live-writer";
 
+fn env_var_trimmed(name: &str) -> Option<String> {
+    let value = std::env::var(name).ok()?;
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct StoredPublishSettings {
     pub notion_token: String,
@@ -23,23 +29,29 @@ pub struct StoredPublishSettings {
 
 impl StoredPublishSettings {
     pub fn notion_config(&self) -> Option<NotionConfig> {
-        (!self.notion_token.is_empty() && !self.notion_parent_page_id.is_empty()).then(|| {
-            NotionConfig {
-                token: self.notion_token.clone(),
-                parent_page_id: self.notion_parent_page_id.clone(),
-            }
-        })
+        if self.notion_token.trim().is_empty() || self.notion_parent_page_id.trim().is_empty() {
+            None
+        } else {
+            Some(NotionConfig {
+                token: self.notion_token.trim().to_owned(),
+                parent_page_id: self.notion_parent_page_id.trim().to_owned(),
+            })
+        }
     }
 
     pub fn typecho_config(&self) -> Option<TypechoConfig> {
-        (!self.typecho_xmlrpc_url.is_empty()
-            && !self.typecho_username.is_empty()
-            && !self.typecho_password.is_empty())
-        .then(|| TypechoConfig {
-            xmlrpc_url: self.typecho_xmlrpc_url.clone(),
-            username: self.typecho_username.clone(),
-            password: self.typecho_password.clone(),
-        })
+        if self.typecho_xmlrpc_url.trim().is_empty()
+            || self.typecho_username.trim().is_empty()
+            || self.typecho_password.trim().is_empty()
+        {
+            None
+        } else {
+            Some(TypechoConfig {
+                xmlrpc_url: self.typecho_xmlrpc_url.trim().to_owned(),
+                username: self.typecho_username.trim().to_owned(),
+                password: self.typecho_password.clone(),
+            })
+        }
     }
 }
 
@@ -52,8 +64,8 @@ pub struct NotionConfig {
 impl NotionConfig {
     pub fn from_env() -> Option<Self> {
         Some(Self {
-            token: std::env::var("OPEN_LIVE_WRITER_NOTION_TOKEN").ok()?,
-            parent_page_id: std::env::var("OPEN_LIVE_WRITER_NOTION_PARENT_PAGE_ID").ok()?,
+            token: env_var_trimmed("OPEN_LIVE_WRITER_NOTION_TOKEN")?,
+            parent_page_id: env_var_trimmed("OPEN_LIVE_WRITER_NOTION_PARENT_PAGE_ID")?,
         })
     }
 }
@@ -68,9 +80,9 @@ pub struct TypechoConfig {
 impl TypechoConfig {
     pub fn from_env() -> Option<Self> {
         Some(Self {
-            xmlrpc_url: std::env::var("OPEN_LIVE_WRITER_TYPECHO_XMLRPC_URL").ok()?,
-            username: std::env::var("OPEN_LIVE_WRITER_TYPECHO_USERNAME").ok()?,
-            password: std::env::var("OPEN_LIVE_WRITER_TYPECHO_PASSWORD").ok()?,
+            xmlrpc_url: env_var_trimmed("OPEN_LIVE_WRITER_TYPECHO_XMLRPC_URL")?,
+            username: env_var_trimmed("OPEN_LIVE_WRITER_TYPECHO_USERNAME")?,
+            password: env_var_trimmed("OPEN_LIVE_WRITER_TYPECHO_PASSWORD")?,
         })
     }
 }
@@ -167,7 +179,14 @@ pub fn notion_blocks(markdown: &str) -> Result<Vec<Value>> {
 }
 
 pub fn local_image_count(markdown: &str) -> usize {
-    markdown.matches("file://").count()
+    let file_url_count = markdown.to_ascii_lowercase().matches("file://").count();
+    let relative_image_count = parse_blocks(markdown)
+        .into_iter()
+        .filter(|block| {
+            matches!(block, Block::Image { url, .. } if !is_public_url(url.as_str()) && !is_file_url(url))
+        })
+        .count();
+    file_url_count + relative_image_count
 }
 
 /// Typecho's MetaWeblog endpoint renders the post body as HTML, so convert the
@@ -251,30 +270,49 @@ fn block_to_notion(block: Block) -> Value {
             "object": "block",
             "type": "code",
             "code": {
-                "rich_text": rich_text(&text),
+                "rich_text": plain_rich_text(&text),
                 "language": notion_code_language(language.as_deref())
             }
         }),
-        Block::Image { url, .. } => json!({
-            "object": "block",
-            "type": "image",
-            "image": {
-                "type": "external",
-                "external": { "url": url }
+        Block::Image { alt, url } => {
+            if is_public_url(&url) {
+                json!({
+                    "object": "block",
+                    "type": "image",
+                    "image": {
+                        "type": "external",
+                        "external": { "url": url }
+                    }
+                })
+            } else {
+                non_public_media_note("图片", alt.as_str(), &url)
             }
-        }),
-        Block::Video { url } => json!({
-            "object": "block",
-            "type": "video",
-            "video": {
-                "type": "external",
-                "external": { "url": url }
+        }
+        Block::Video { url } => {
+            if is_public_url(&url) {
+                json!({
+                    "object": "block",
+                    "type": "video",
+                    "video": {
+                        "type": "external",
+                        "external": { "url": url }
+                    }
+                })
+            } else {
+                non_public_media_note("视频", "", &url)
             }
-        }),
+        }
         Block::Table { headers, rows } => {
-            let width = headers.len().max(1);
-            let mut children = vec![notion_table_row(headers)];
-            children.extend(rows.into_iter().map(notion_table_row));
+            let width = std::iter::once(headers.len())
+                .chain(rows.iter().map(Vec::len))
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let mut children = vec![notion_table_row(pad_table_cells(headers, width))];
+            children.extend(
+                rows.into_iter()
+                    .map(|row| notion_table_row(pad_table_cells(row, width))),
+            );
             json!({
                 "object": "block",
                 "type": "table",
@@ -297,6 +335,37 @@ fn block_to_notion(block: Block) -> Value {
             "paragraph": { "rich_text": rich_text(&text) }
         }),
     }
+}
+
+fn is_public_url(url: &str) -> bool {
+    let url = url.trim().to_ascii_lowercase();
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
+fn is_file_url(url: &str) -> bool {
+    url.trim().to_ascii_lowercase().starts_with("file://")
+}
+
+fn non_public_media_note(kind: &str, label: &str, url: &str) -> Value {
+    let label = label.trim();
+    let text = if label.is_empty() {
+        format!("{kind}未上传：{url}")
+    } else {
+        format!("{kind}未上传：{label}（{url}）")
+    };
+    json!({
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": { "rich_text": rich_text(&text) }
+    })
+}
+
+fn pad_table_cells(mut cells: Vec<String>, width: usize) -> Vec<String> {
+    if cells.len() < width {
+        cells.extend(std::iter::repeat_with(String::new).take(width - cells.len()));
+    }
+    cells.truncate(width);
+    cells
 }
 
 fn notion_table_row(cells: Vec<String>) -> Value {
@@ -322,6 +391,12 @@ fn rich_text(text: &str) -> Vec<Value> {
             piece.link.as_deref(),
         );
     }
+    result
+}
+
+fn plain_rich_text(text: &str) -> Vec<Value> {
+    let mut result = Vec::new();
+    push_rich_text(&mut result, text, &[], None);
     result
 }
 
