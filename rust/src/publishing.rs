@@ -1,20 +1,107 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use futures::future::{Either, select};
 use futures::io::AsyncReadExt;
+use futures::{
+    channel::oneshot,
+    future::{BoxFuture, Either, select},
+};
 use gpui::Timer;
-use gpui::http_client::{AsyncBody, HttpClient, Method, Request};
+use gpui::http_client::{
+    AsyncBody, HttpClient, Method, Request, Response, StatusCode, Url, http::HeaderValue,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::markdown::{Block, InlineStyle, parse_blocks, parse_inline, strip_inline};
 
-const NOTION_VERSION: &str = "2022-06-28";
+const NOTION_VERSION: &str = "2026-03-11";
 pub const CREDENTIALS_URL: &str = "open-live-writer://publishing";
 pub const CREDENTIALS_USERNAME: &str = "open-live-writer";
 
 const REQUEST_TIMEOUT_SECONDS: u64 = 30;
+const HTTP_USER_AGENT: &str = "Open-Live-Writer/0.1";
+
+/// GPUI's default application client is a deliberately blocked placeholder.
+/// Install a real client before any publishing action is dispatched.
+struct ReqwestHttpClient {
+    client: reqwest::blocking::Client,
+    user_agent: HeaderValue,
+}
+
+impl ReqwestHttpClient {
+    fn new() -> Self {
+        Self {
+            client: reqwest::blocking::Client::new(),
+            user_agent: HeaderValue::from_static(HTTP_USER_AGENT),
+        }
+    }
+}
+
+pub fn default_http_client() -> Arc<dyn HttpClient> {
+    Arc::new(ReqwestHttpClient::new())
+}
+
+impl HttpClient for ReqwestHttpClient {
+    fn type_name(&self) -> &'static str {
+        "open_live_writer::ReqwestHttpClient"
+    }
+
+    fn user_agent(&self) -> Option<&HeaderValue> {
+        Some(&self.user_agent)
+    }
+
+    fn send(
+        &self,
+        request: Request<AsyncBody>,
+    ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let (parts, mut body) = request.into_parts();
+            let mut request_body = Vec::new();
+            body.read_to_end(&mut request_body).await?;
+
+            let (sender, receiver) = oneshot::channel();
+            std::thread::Builder::new()
+                .name("open-live-writer-http".to_owned())
+                .spawn(move || {
+                    let _ = sender.send(send_with_reqwest(client, parts, request_body));
+                })?;
+            receiver
+                .await
+                .map_err(|_| anyhow::anyhow!("HTTP 请求线程意外退出"))?
+        })
+    }
+
+    fn proxy(&self) -> Option<&Url> {
+        None
+    }
+}
+
+fn send_with_reqwest(
+    client: reqwest::blocking::Client,
+    parts: gpui::http_client::http::request::Parts,
+    request_body: Vec<u8>,
+) -> anyhow::Result<Response<AsyncBody>> {
+    let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?;
+    let mut request_builder = client
+        .request(method, parts.uri.to_string())
+        .body(request_body);
+    for (name, value) in &parts.headers {
+        request_builder = request_builder.header(name.as_str(), value.as_bytes());
+    }
+
+    let response = request_builder.send()?;
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let response_body = response.bytes()?;
+
+    let mut response_builder = Response::builder().status(status);
+    for (name, value) in &headers {
+        response_builder = response_builder.header(name.as_str(), value.as_bytes());
+    }
+    Ok(response_builder.body(AsyncBody::from(response_body.to_vec()))?)
+}
 
 /// 给发布请求加超时，避免服务端无响应时永久挂起。
 async fn request_with_timeout<T, F>(future: F) -> Result<T>
@@ -105,48 +192,264 @@ impl TypechoConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NotionTarget {
+    id: String,
+    database_hint: bool,
+}
+
+impl NotionTarget {
+    fn parse(input: &str) -> Self {
+        let input = input.trim();
+        let query = input.split_once('?').map(|(_, query)| query).unwrap_or("");
+        let database_hint = query
+            .split('&')
+            .any(|parameter| parameter == "v" || parameter.starts_with("v="));
+        let path = input.split(['?', '#']).next().unwrap_or(input);
+        let id = path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(path)
+            .to_owned();
+        Self { id, database_hint }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotionPublishResult {
+    pub id: String,
+    pub url: String,
+}
+
 pub async fn publish_to_notion(
     http: Arc<dyn HttpClient>,
     config: NotionConfig,
     title: &str,
     markdown: &str,
-) -> Result<String> {
+) -> Result<NotionPublishResult> {
+    let target = NotionTarget::parse(&config.parent_page_id);
+    if target.id.is_empty() {
+        bail!("Notion parent page or database ID is empty");
+    }
     let children = notion_blocks(markdown)?;
-    let payload = json!({
-        "parent": { "page_id": config.parent_page_id },
-        "properties": {
-            "title": {
-                "title": [{ "type": "text", "text": { "content": title } }]
-            }
-        },
+    if target.database_hint {
+        return publish_to_notion_data_source(http, &config, &target.id, title, children).await;
+    }
+
+    let payload = notion_page_payload(
+        json!({ "page_id": target.id }),
+        "title",
+        title,
+        children.clone(),
+    );
+    let request = notion_request(
+        &config.token,
+        Method::POST,
+        "https://api.notion.com/v1/pages".to_owned(),
+        Some(payload),
+    )?;
+    let (status, body) = send_notion_request(http.clone(), request).await?;
+    if status.is_success() {
+        return parse_notion_page_id(status, &body);
+    }
+    if status.as_u16() != 404 {
+        bail!(
+            "Notion returned HTTP {}: {}",
+            status.as_u16(),
+            response_text(&body)
+        );
+    }
+
+    match publish_to_notion_data_source(http, &config, &target.id, title, children).await {
+        Ok(page) => Ok(page),
+        Err(database_error) => bail!(
+            "Notion returned HTTP 404: the parent page was not found; database/data-source fallback also failed: {database_error}"
+        ),
+    }
+}
+
+async fn publish_to_notion_data_source(
+    http: Arc<dyn HttpClient>,
+    config: &NotionConfig,
+    database_id: &str,
+    title: &str,
+    children: Vec<Value>,
+) -> Result<NotionPublishResult> {
+    let data_source_id = resolve_notion_data_source(http.clone(), config, database_id).await?;
+    let title_property = notion_title_property(http.clone(), config, &data_source_id).await?;
+    let payload = notion_page_payload(
+        json!({ "data_source_id": data_source_id }),
+        &title_property,
+        title,
+        children,
+    );
+    let request = notion_request(
+        &config.token,
+        Method::POST,
+        "https://api.notion.com/v1/pages".to_owned(),
+        Some(payload),
+    )?;
+    let (status, body) = send_notion_request(http, request).await?;
+    parse_notion_page_id(status, &body)
+}
+
+async fn resolve_notion_data_source(
+    http: Arc<dyn HttpClient>,
+    config: &NotionConfig,
+    target_id: &str,
+) -> Result<String> {
+    let database_request = notion_request(
+        &config.token,
+        Method::GET,
+        format!("https://api.notion.com/v1/databases/{target_id}"),
+        None,
+    )?;
+    let (database_status, database_body) =
+        send_notion_request(http.clone(), database_request).await?;
+    if database_status.is_success() {
+        let database: Value = serde_json::from_slice(&database_body)?;
+        return database["data_sources"]
+            .as_array()
+            .and_then(|data_sources| {
+                data_sources
+                    .iter()
+                    .find_map(|data_source| data_source["id"].as_str())
+            })
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("Notion database has no available data source"));
+    }
+    if database_status.as_u16() != 404 {
+        bail!(
+            "Notion database lookup returned HTTP {}: {}",
+            database_status.as_u16(),
+            response_text(&database_body)
+        );
+    }
+
+    let data_source_request = notion_request(
+        &config.token,
+        Method::GET,
+        format!("https://api.notion.com/v1/data_sources/{target_id}"),
+        None,
+    )?;
+    let (data_source_status, data_source_body) =
+        send_notion_request(http, data_source_request).await?;
+    if data_source_status.is_success() {
+        return Ok(target_id.to_owned());
+    }
+    bail!(
+        "database HTTP {}: {}; data source HTTP {}: {}",
+        database_status.as_u16(),
+        response_text(&database_body),
+        data_source_status.as_u16(),
+        response_text(&data_source_body)
+    );
+}
+
+async fn notion_title_property(
+    http: Arc<dyn HttpClient>,
+    config: &NotionConfig,
+    data_source_id: &str,
+) -> Result<String> {
+    let request = notion_request(
+        &config.token,
+        Method::GET,
+        format!("https://api.notion.com/v1/data_sources/{data_source_id}"),
+        None,
+    )?;
+    let (status, body) = send_notion_request(http, request).await?;
+    if !status.is_success() {
+        bail!(
+            "Notion data-source lookup returned HTTP {}: {}",
+            status.as_u16(),
+            response_text(&body)
+        );
+    }
+    let data_source: Value = serde_json::from_slice(&body)?;
+    data_source["properties"]
+        .as_object()
+        .and_then(|properties| {
+            properties.iter().find_map(|(name, property)| {
+                (property["type"] == "title" || property.get("title").is_some())
+                    .then(|| name.to_owned())
+            })
+        })
+        .ok_or_else(|| anyhow::anyhow!("Notion data source has no title property"))
+}
+
+fn notion_page_payload(
+    parent: Value,
+    title_property: &str,
+    title: &str,
+    children: Vec<Value>,
+) -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        title_property.to_owned(),
+        json!({
+            "type": "title",
+            "title": [{ "type": "text", "text": { "content": title } }]
+        }),
+    );
+    json!({
+        "parent": parent,
+        "properties": Value::Object(properties),
         "children": children,
-    });
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri("https://api.notion.com/v1/pages")
-        .header("Authorization", format!("Bearer {}", config.token))
+    })
+}
+
+fn notion_request(
+    token: &str,
+    method: Method,
+    uri: String,
+    payload: Option<Value>,
+) -> Result<Request<AsyncBody>> {
+    let body = match payload {
+        Some(payload) => serde_json::to_vec(&payload)?,
+        None => Vec::new(),
+    };
+    Ok(Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
         .header("Notion-Version", NOTION_VERSION)
         .header("Content-Type", "application/json")
-        .body(AsyncBody::from(serde_json::to_vec(&payload)?))?;
-    let (status, body) = request_with_timeout(async {
+        .body(AsyncBody::from(body))?)
+}
+
+async fn send_notion_request(
+    http: Arc<dyn HttpClient>,
+    request: Request<AsyncBody>,
+) -> Result<(StatusCode, Vec<u8>)> {
+    request_with_timeout(async {
         let mut response = http.send(request).await?;
         let status = response.status();
         let body = read_body(&mut response).await?;
         Ok::<_, anyhow::Error>((status, body))
     })
-    .await?;
+    .await
+}
+
+fn parse_notion_page_id(status: StatusCode, body: &[u8]) -> Result<NotionPublishResult> {
     if !status.is_success() {
         bail!(
-            "Notion 返回 HTTP {}：{}",
+            "Notion returned HTTP {}: {}",
             status.as_u16(),
-            response_text(&body)
+            response_text(body)
         );
     }
-    let result: Value = serde_json::from_slice(&body)?;
-    result["id"]
+    let result: Value = serde_json::from_slice(body)?;
+    let id = result["id"]
         .as_str()
         .map(ToOwned::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("Notion 返回成功但没有页面 ID"))
+        .ok_or_else(|| anyhow::anyhow!("Notion returned success without a page ID"))?;
+    let url = result["url"]
+        .as_str()
+        .filter(|url| !url.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("Notion returned success without a page URL"))?;
+    Ok(NotionPublishResult { id, url })
 }
 
 pub async fn publish_to_typecho(
@@ -184,13 +487,17 @@ pub async fn publish_to_typecho(
 }
 
 pub fn document_title(markdown: &str) -> String {
-    parse_blocks(markdown)
-        .into_iter()
-        .find_map(|block| match block {
-            Block::Heading { text, .. } => Some(strip_inline(&text)),
-            Block::Paragraph(text) => Some(strip_inline(&text)),
-            _ => None,
-        })
+    let blocks = parse_blocks(markdown);
+    let heading_title = blocks.iter().find_map(|block| match block {
+        Block::Heading { text, .. } => Some(strip_inline(text)),
+        _ => None,
+    });
+    let paragraph_title = blocks.into_iter().find_map(|block| match block {
+        Block::Paragraph(text) => Some(strip_inline(&text)),
+        _ => None,
+    });
+    heading_title
+        .or(paragraph_title)
         .filter(|title| !title.trim().is_empty())
         .map(|title| title.chars().take(100).collect())
         .unwrap_or_else(|| "未命名文章".to_owned())
@@ -502,10 +809,77 @@ fn extract_xml_value(response: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        document_title, local_image_count, markdown_to_html, metaweblog_new_post_xml,
-        notion_blocks, xml_escape,
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
     };
+
+    use futures::executor::block_on;
+    use gpui::http_client::{AsyncBody, Method, Request};
+    use serde_json::json;
+
+    use super::{
+        NotionTarget, default_http_client, document_title, local_image_count, markdown_to_html,
+        metaweblog_new_post_xml, notion_blocks, notion_page_payload, read_body, xml_escape,
+    };
+
+    #[test]
+    fn default_http_client_sends_requests_without_a_tokio_runtime() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let size = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            assert!(request.starts_with("POST / HTTP/1.1"));
+            assert!(request.contains("hello"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+        });
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://{address}/"))
+            .body(AsyncBody::from(b"hello".to_vec()))
+            .unwrap();
+        let mut response = block_on(default_http_client().send(request)).unwrap();
+        let body = block_on(read_body(&mut response)).unwrap();
+
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(body, b"ok");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn parses_notion_page_and_database_targets() {
+        let database = NotionTarget::parse(
+            "https://app.notion.com/p/tooktang/14c856c35cbc80a1aa43eb1c4955c328?v=28fcd53b378a47bfb371e339f0976aff",
+        );
+        assert_eq!(database.id, "14c856c35cbc80a1aa43eb1c4955c328");
+        assert!(database.database_hint);
+
+        let page = NotionTarget::parse("14c856c35cbc80a1aa43eb1c4955c328");
+        assert_eq!(page.id, "14c856c35cbc80a1aa43eb1c4955c328");
+        assert!(!page.database_hint);
+    }
+
+    #[test]
+    fn builds_database_page_payload_with_dynamic_title_property() {
+        let payload = notion_page_payload(
+            json!({ "data_source_id": "data-source-id" }),
+            "Name",
+            "Article title",
+            Vec::new(),
+        );
+        assert_eq!(payload["parent"]["data_source_id"], "data-source-id");
+        assert_eq!(
+            payload["properties"]["Name"]["title"][0]["text"]["content"],
+            "Article title"
+        );
+    }
 
     #[test]
     fn exports_notion_blocks_without_losing_ordered_list_semantics() {
@@ -590,6 +964,7 @@ mod tests {
     #[test]
     fn derives_a_stable_title_and_escapes_xml() {
         assert_eq!(document_title("# 我的文章\n\n正文"), "我的文章");
+        assert_eq!(document_title("开头说明\n\n# 正式标题"), "正式标题");
         assert_eq!(xml_escape("<a&\"'"), "&lt;a&amp;&quot;&apos;");
         let xml = metaweblog_new_post_xml("u&", "p", "标题", "正文");
         assert!(xml.contains("<string>u&amp;</string>"));

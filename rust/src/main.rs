@@ -29,8 +29,8 @@ use rust_embed::Embed;
 use crate::markdown::{Block, InlineStyle, RichTextPiece, parse_blocks, parse_inline};
 use crate::publishing::{
     CREDENTIALS_URL, CREDENTIALS_USERNAME, NotionConfig, StoredPublishSettings, TypechoConfig,
-    document_title, local_image_count, publish_to_notion as publish_notion_request,
-    publish_to_typecho as publish_typecho_request,
+    default_http_client, document_title, local_image_count,
+    publish_to_notion as publish_notion_request, publish_to_typecho as publish_typecho_request,
 };
 
 const DEFAULT_MARKDOWN: &str = "# 欢迎回来，Open Live Writer\n\n这是一个保持怀旧外观的 Markdown 编辑器。你可以直接编辑左侧内容，然后切换到预览。\n\n- 使用工具栏快速插入 Markdown\n- 点击“复制到 Notion”复制可粘贴的 Markdown\n- 文件使用 UTF-8 的 md 格式保存\n- [ ] GitHub 待办清单\n- [x] 已完成的待办\n\n<aside>💡 Notion 旁注块</aside>\n\n> 先写作，再发布。\n";
@@ -603,6 +603,17 @@ impl MarkdownEditor {
         cx.notify();
     }
 
+    fn close_settings(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings_visible {
+            self.toggle_settings(&ToggleSettings, window, cx);
+        }
+    }
+
     fn save_publish_settings(
         &mut self,
         _: &gpui::ClickEvent,
@@ -683,6 +694,7 @@ impl MarkdownEditor {
     }
 
     fn new_document(&mut self, _: &NewDocument, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_visible = false;
         if self.dirty {
             self.confirm_discard(PendingOperation::New, window, cx);
             return;
@@ -693,7 +705,7 @@ impl MarkdownEditor {
     fn new_document_now(&mut self, cx: &mut Context<Self>) {
         self.replace_document(
             None,
-            LoadedDocument::new("# 未命名文章\n\n".to_owned(), FileEncoding::Utf8),
+            LoadedDocument::new(String::new(), FileEncoding::Utf8),
             cx,
         );
         self.status = "新文章 · 尚未保存".into();
@@ -709,6 +721,7 @@ impl MarkdownEditor {
     }
 
     fn save_draft(&mut self, _: &SaveDraft, _window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_visible = false;
         let content = self.content(cx);
         match storage::save_draft(&content) {
             Ok(path) => {
@@ -732,6 +745,7 @@ impl MarkdownEditor {
     }
 
     fn open_draft(&mut self, _: &OpenDraft, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_visible = false;
         if self.dirty {
             self.confirm_discard(PendingOperation::OpenDraft, window, cx);
             return;
@@ -774,6 +788,11 @@ impl MarkdownEditor {
             cx,
         );
         let current_path = self.path.clone();
+        let suggested_name = if current_path.is_none() {
+            Some(default_markdown_filename(&self.content(cx)))
+        } else {
+            None
+        };
         cx.spawn(async move |editor, cx| match answer.await.ok() {
             Some(0) => {
                 if let Some(path) = current_path {
@@ -785,7 +804,10 @@ impl MarkdownEditor {
                     return;
                 }
                 let Ok(receiver) = cx.update(|app| {
-                    app.prompt_for_new_path(&default_save_directory(), Some("未命名文章.md"))
+                    app.prompt_for_new_path(
+                        &default_save_directory(),
+                        Some(suggested_name.as_deref().unwrap_or("未命名文章.md")),
+                    )
                 }) else {
                     return;
                 };
@@ -815,6 +837,7 @@ impl MarkdownEditor {
     }
 
     fn open_document(&mut self, _: &OpenDocument, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_visible = false;
         if self.dirty {
             self.confirm_discard(PendingOperation::Open, window, cx);
             return;
@@ -900,11 +923,13 @@ impl MarkdownEditor {
     }
 
     fn save_document(&mut self, _: &SaveDocument, _window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_visible = false;
         if let Some(path) = self.path.clone() {
             self.save_to(path, cx);
             return;
         }
-        let receiver = cx.prompt_for_new_path(&default_save_directory(), Some("未命名文章.md"));
+        let suggested_name = default_markdown_filename(&self.content(cx));
+        let receiver = cx.prompt_for_new_path(&default_save_directory(), Some(&suggested_name));
         cx.spawn(async move |editor, cx| {
             let Ok(Ok(Some(path))) = receiver.await else {
                 return;
@@ -924,6 +949,7 @@ impl MarkdownEditor {
     }
 
     fn toggle_preview(&mut self, _: &TogglePreview, _window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_visible = false;
         self.preview = !self.preview;
         self.status = if self.preview {
             if self.dirty {
@@ -968,6 +994,11 @@ impl MarkdownEditor {
             cx,
         );
         let current_path = self.path.clone();
+        let suggested_name = if current_path.is_none() {
+            Some(default_markdown_filename(&self.content(cx)))
+        } else {
+            None
+        };
         cx.spawn(async move |editor, cx| match answer.await.ok() {
             Some(0) => {
                 if let Some(path) = current_path {
@@ -986,7 +1017,10 @@ impl MarkdownEditor {
                     return;
                 }
                 let Ok(receiver) = cx.update(|app| {
-                    app.prompt_for_new_path(&default_save_directory(), Some("未命名文章.md"))
+                    app.prompt_for_new_path(
+                        &default_save_directory(),
+                        Some(suggested_name.as_deref().unwrap_or("未命名文章.md")),
+                    )
                 }) else {
                     return;
                 };
@@ -1025,6 +1059,7 @@ impl MarkdownEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.settings_visible = false;
         let markdown = self.content(cx);
         let title = document_title(&markdown);
         let warning = local_image_warning(&markdown);
@@ -1037,8 +1072,8 @@ impl MarkdownEditor {
             cx.notify();
             cx.spawn(async move |editor, cx| {
                 match publish_notion_request(http, config, &title, &markdown).await {
-                    Ok(page_id) => {
-                        let url = format!("https://www.notion.so/{page_id}");
+                    Ok(page) => {
+                        let url = page.url;
                         let _ = cx.update(|app| app.open_url(&url));
                         let _ = cx.update(|app| {
                             app.write_to_clipboard(ClipboardItem::new_string(url.clone()))
@@ -1094,6 +1129,7 @@ impl MarkdownEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.settings_visible = false;
         let markdown = self.content(cx);
         let title = document_title(&markdown);
         let warning = local_image_warning(&markdown);
@@ -1160,6 +1196,7 @@ impl MarkdownEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.settings_visible = false;
         self.text_input.update(cx, |input, cx| {
             input.wrap_selection(prefix, suffix, window, cx)
         });
@@ -1174,6 +1211,7 @@ impl MarkdownEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.settings_visible = false;
         self.text_input
             .update(cx, |input, cx| input.toggle_line_prefix(prefix, window, cx));
         self.status = message.to_owned().into();
@@ -1211,6 +1249,7 @@ impl MarkdownEditor {
     }
 
     fn insert_snippet(&mut self, snippet: String, message: &'static str, cx: &mut Context<Self>) {
+        self.settings_visible = false;
         self.text_input
             .update(cx, |input, cx| input.queue_insert(snippet, cx));
         self.status = message.into();
@@ -1407,7 +1446,11 @@ impl MarkdownEditor {
                 ribbon_small_button(small_icon, small_label, cx.listener(small_click)),
                 ribbon_small_button(
                     "icons/settings.png",
-                    "发布设置",
+                    if self.settings_visible {
+                        "返回编辑"
+                    } else {
+                        "发布设置"
+                    },
                     cx.listener(|editor, _event, window, cx| {
                         editor.toggle_settings(&ToggleSettings, window, cx)
                     }),
@@ -1831,7 +1874,11 @@ impl MarkdownEditor {
                     ribbon_controls!(
                         ribbon_large_button(
                             "icons/settings-large.png",
-                            "设置",
+                            if self.settings_visible {
+                                "返回编辑"
+                            } else {
+                                "设置"
+                            },
                             cx.listener(|editor, _event, window, cx| {
                                 editor.toggle_settings(&ToggleSettings, window, cx)
                             }),
@@ -1893,7 +1940,11 @@ impl MarkdownEditor {
                     "选项",
                     ribbon_controls!(ribbon_large_button(
                         "icons/settings-large.png",
-                        "发布设置",
+                        if self.settings_visible {
+                            "返回编辑"
+                        } else {
+                            "发布设置"
+                        },
                         cx.listener(|editor, _event, window, cx| {
                             editor.toggle_settings(&ToggleSettings, window, cx)
                         }),
@@ -1936,6 +1987,7 @@ impl Render for MarkdownEditor {
                     self.typecho_url_input.clone(),
                     self.typecho_username_input.clone(),
                     self.typecho_password_input.clone(),
+                    cx.listener(Self::close_settings),
                     cx.listener(Self::save_publish_settings),
                 ))
         } else if self.preview {
@@ -2130,7 +2182,7 @@ fn decode_markdown(bytes: &[u8]) -> Result<LoadedDocument, String> {
 }
 
 fn decode_utf16_bytes(bytes: &[u8], little_endian: bool) -> Result<String, String> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err("UTF-16 文件损坏：字节长度不是偶数".to_owned());
     }
     let units = bytes
@@ -2197,6 +2249,32 @@ fn default_save_directory() -> PathBuf {
         }
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn default_markdown_filename(markdown: &str) -> String {
+    let mut name = document_title(markdown)
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    name = name.trim().trim_end_matches(['.', ' ']).to_owned();
+    if name.is_empty() {
+        name = "未命名文章".to_owned();
+    }
+    if !name.to_ascii_lowercase().ends_with(".md") {
+        name.push_str(".md");
+    }
+    name
 }
 
 fn local_image_warning(markdown: &str) -> String {
@@ -2441,6 +2519,7 @@ fn settings_panel(
     typecho_url: Entity<MarkdownInput>,
     typecho_username: Entity<MarkdownInput>,
     typecho_password: Entity<MarkdownInput>,
+    on_close: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     on_save: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
@@ -2494,8 +2573,8 @@ fn settings_panel(
                             notion_token,
                         ))
                         .child(settings_field(
-                            "父页面 ID",
-                            "新文章会作为子页面创建在这里",
+                            "父页面或数据库 ID",
+                            "支持普通页面 ID、数据库 ID 或完整 Notion 链接",
                             notion_parent,
                         )),
                 )
@@ -2535,7 +2614,19 @@ fn settings_panel(
                 ),
         )
         .child(
-            div().flex().justify_end().child(
+            div().flex().justify_end().gap_2().child(
+                div()
+                    .id("close-publish-settings")
+                    .px_4()
+                    .py_2()
+                    .rounded_sm()
+                    .bg(rgb(0xd7e2ec))
+                    .text_color(rgb(TEXT))
+                    .hover(|style| style.bg(rgb(0xc8d7e5)).cursor_pointer())
+                    .on_click(on_close)
+                    .child("返回编辑"),
+                )
+                .child(
                 div()
                     .id("save-publish-settings")
                     .px_4()
@@ -3088,7 +3179,10 @@ fn preview_inline_piece(piece: &RichTextPiece) -> gpui::AnyElement {
 }
 
 fn main() {
-    Application::new().with_assets(Assets).run(|cx: &mut App| {
+    let application = Application::new()
+        .with_assets(Assets)
+        .with_http_client(default_http_client());
+    application.run(|cx: &mut App| {
         gpui_component::init(cx);
         // The application uses a fixed light Windows Live Writer palette. Keep the component
         // editor in the matching light theme instead of inheriting the system dark theme.
@@ -3169,11 +3263,21 @@ fn main() {
                         .detach();
                 }
                 window.on_window_should_close(cx, move |window, cx| {
-                    let (dirty, close_confirmed, path) = editor
-                        .read_with(cx, |editor, _| {
-                            (editor.dirty, editor.close_confirmed, editor.path.clone())
+                    let (dirty, close_confirmed, path, content) = editor
+                        .read_with(cx, |editor, cx| {
+                            (
+                                editor.dirty,
+                                editor.close_confirmed,
+                                editor.path.clone(),
+                                editor.content(cx),
+                            )
                         })
-                        .unwrap_or((false, false, None));
+                        .unwrap_or((false, false, None, String::new()));
+                    let suggested_name = if path.is_none() {
+                        Some(default_markdown_filename(&content))
+                    } else {
+                        None
+                    };
                     if !dirty || close_confirmed {
                         return true;
                     }
@@ -3206,7 +3310,7 @@ fn main() {
                                 let Ok(receiver) = cx.update(|_, cx| {
                                     cx.prompt_for_new_path(
                                         &default_save_directory(),
-                                        Some("未命名文章.md"),
+                                        Some(suggested_name.as_deref().unwrap_or("未命名文章.md")),
                                     )
                                 }) else {
                                     return;
@@ -3251,8 +3355,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        EmbeddedAssets, is_image_path, line_end, line_starts, markdown_image_url,
-        normalize_newlines, percent_decode, typecho_is_primary_publish_target, utf16_range_to_utf8,
+        EmbeddedAssets, default_markdown_filename, is_image_path, line_end, line_starts,
+        markdown_image_url, normalize_newlines, percent_decode, typecho_is_primary_publish_target,
+        utf16_range_to_utf8,
     };
 
     #[test]
@@ -3278,6 +3383,18 @@ mod tests {
         assert_eq!(percent_decode("%E5%B0%81%E9%9D%A2"), "封面");
         assert_eq!(percent_decode("a%20b.png"), "a b.png");
         assert!(!is_image_path(Path::new("/tmp/article.md")));
+    }
+
+    #[test]
+    fn suggests_markdown_title_as_filename() {
+        assert_eq!(
+            default_markdown_filename("# Endless Fight: Babel?\n\n正文"),
+            "Endless Fight_ Babel_.md"
+        );
+        assert_eq!(
+            default_markdown_filename(""),
+            "\u{672a}\u{547d}\u{540d}\u{6587}\u{7ae0}.md"
+        );
     }
 
     #[test]

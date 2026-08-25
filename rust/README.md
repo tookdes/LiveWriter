@@ -31,6 +31,8 @@ OPEN_LIVE_WRITER_TYPECHO_USERNAME
 OPEN_LIVE_WRITER_TYPECHO_PASSWORD
 ```
 
+`OPEN_LIVE_WRITER_NOTION_PARENT_PAGE_ID` 可填写普通页面 ID、数据库 ID 或完整 Notion 链接。
+
 ```sh
 cargo fmt --all
 cargo test --manifest-path rust/Cargo.toml
