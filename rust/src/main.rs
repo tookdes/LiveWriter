@@ -1,37 +1,52 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod editing;
 mod markdown;
 mod publishing;
 mod storage;
 
 use std::{
+    backtrace::Backtrace,
     borrow::Cow,
     collections::HashMap,
     fs,
+    io::Write,
     ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use gpui::{
-    AnyElement, App, Application, AssetSource, Bounds, ClipboardItem, Context, CursorStyle, Entity,
-    EntityInputHandler, FocusHandle, Focusable, FontWeight, Image, ImageFormat, ImageSource, Img,
-    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
-    Pixels, PromptLevel, SharedString, Window, WindowBounds, WindowOptions, actions, div, hsla,
-    img, linear_color_stop, linear_gradient, prelude::*, px, relative, rgb, size, white,
+    AnyElement, App, Application, AssetSource, Bounds, ClipboardEntry, ClipboardItem, Context,
+    CursorStyle, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable, FontStyle,
+    FontWeight, HighlightStyle, Image, ImageFormat, ImageSource, Img, KeyBinding, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, PromptLevel,
+    ScrollHandle, SharedString, StrikethroughStyle, StyledText, UnderlineStyle, Window,
+    WindowBounds, WindowOptions, actions, div, hsla, img, linear_color_stop, linear_gradient,
+    point, prelude::*, px, relative, rgb, size, white,
 };
 use gpui_component::{
-    RopeExt, Theme, ThemeMode,
+    RopeExt, Theme, ThemeMode, WindowExt,
     input::{Input, InputEvent, InputState},
+    notification::Notification,
+    tooltip::Tooltip,
 };
 use rust_embed::Embed;
 
-use crate::markdown::{Block, InlineStyle, RichTextPiece, parse_blocks, parse_inline};
+use crate::editing::{
+    character_count, document_outline, is_clipboard_url, looks_like_url, markdown_code_block,
+    markdown_link, markdown_table, normalize_url, selection_has_wrap, set_heading_level,
+    toggle_prefixes, wrap_or_unwrap,
+};
+use crate::markdown::{Block, InlineStyle, parse_blocks, parse_inline};
 use crate::publishing::{
     CREDENTIALS_URL, CREDENTIALS_USERNAME, NotionConfig, StoredPublishSettings, TypechoConfig,
-    default_http_client, document_title, local_image_count,
-    publish_to_notion as publish_notion_request, publish_to_typecho as publish_typecho_request,
+    default_http_client, document_title, local_image_count, local_images,
+    publish_or_update_typecho, publish_to_notion as publish_notion_request, test_notion_connection,
+    test_typecho_connection,
 };
+use crate::storage::{DocumentMeta, DraftEntry, EditorPrefs, WorkspaceMode, crash_log_path};
 
 const DEFAULT_MARKDOWN: &str = "# 欢迎回来，Open Live Writer\n\n这是一个保持怀旧外观的 Markdown 编辑器。你可以直接编辑左侧内容，然后切换到预览。\n\n- 使用工具栏快速插入 Markdown\n- 点击“复制到 Notion”复制可粘贴的 Markdown\n- 文件使用 UTF-8 的 md 格式保存\n- [ ] GitHub 待办清单\n- [x] 已完成的待办\n\n<aside>💡 Notion 旁注块</aside>\n\n> 先写作，再发布。\n";
 
@@ -104,8 +119,21 @@ actions!(
         OpenDocument,
         OpenDraft,
         SaveDocument,
+        SaveAsDocument,
         SaveDraft,
         TogglePreview,
+        CycleWorkspace,
+        ToggleFocus,
+        ToggleOutline,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
+        Heading2Text,
+        Heading3Text,
+        CodeBlockText,
+        PasteImage,
+        ShowDrafts,
+        ShowRecent,
         BoldText,
         ItalicText,
         HeadingText,
@@ -151,6 +179,7 @@ struct MarkdownInput {
     pending_content: Option<SharedString>,
     pending_insert: Option<SharedString>,
     refocus_on_recreate: bool,
+    pub font_size: f32,
     _subscription: gpui::Subscription,
 }
 
@@ -179,6 +208,7 @@ impl MarkdownInput {
             pending_content: None,
             pending_insert: None,
             refocus_on_recreate: false,
+            font_size: if multi_line { 16. } else { 14. },
             _subscription: subscription,
         }
     }
@@ -239,6 +269,44 @@ impl MarkdownInput {
         }
     }
 
+    fn current_range(&self, window: &mut Window, cx: &mut Context<Self>) -> std::ops::Range<usize> {
+        self.state.update(cx, |state, cx| {
+            let Some(selection) = state.selected_text_range(false, window, cx) else {
+                let cursor = state.cursor();
+                return cursor..cursor;
+            };
+            state.text().offset_utf16_to_offset(selection.range.start)
+                ..state.text().offset_utf16_to_offset(selection.range.end)
+        })
+    }
+
+    fn apply_document_edit(
+        &mut self,
+        next: String,
+        cursor: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.state.clone();
+        state.update(cx, |state, cx| {
+            let full = state.text().to_string();
+            if full == next {
+                return;
+            }
+            let range_utf16 = utf16_range_from_utf8(&full, 0..full.len());
+            <InputState as EntityInputHandler>::replace_text_in_range(
+                state,
+                Some(range_utf16),
+                &next,
+                window,
+                cx,
+            );
+            let cursor = cursor.min(state.text().len());
+            let position = state.text().offset_to_position(cursor);
+            state.set_cursor_position(position, window, cx);
+        });
+    }
+
     fn wrap_selection(
         &mut self,
         prefix: &str,
@@ -246,57 +314,53 @@ impl MarkdownInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let prefix = prefix.to_owned();
-        let suffix = suffix.to_owned();
-        let state = self.state.clone();
-        state.update(cx, |state, cx| {
-            let Some(selection) = state.selected_text_range(false, window, cx) else {
-                return;
-            };
-            let range = state.text().offset_utf16_to_offset(selection.range.start)
-                ..state.text().offset_utf16_to_offset(selection.range.end);
-            let cursor_inside = range.start + prefix.len();
-            let move_cursor_inside = range.is_empty();
-            let selected = state.text().slice(range).to_string();
-            state.replace(format!("{}{}{}", prefix, selected, suffix), window, cx);
-            if move_cursor_inside {
-                let position = state.text().offset_to_position(cursor_inside);
-                state.set_cursor_position(position, window, cx);
-            }
-        });
+        let range = self.current_range(window, cx);
+        let full = self.state.read(cx).text().to_string();
+        let (next, next_range) = wrap_or_unwrap(&full, range, prefix, suffix);
+        self.apply_document_edit(next, next_range.end, window, cx);
+    }
+
+    #[allow(dead_code)]
+    fn has_wrap(
+        &self,
+        prefix: &str,
+        suffix: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let range = self.current_range(window, cx);
+        let full = self.state.read(cx).text().to_string();
+        selection_has_wrap(&full, range, prefix, suffix)
     }
 
     fn toggle_line_prefix(&mut self, prefix: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let prefix = prefix.to_owned();
-        let state = self.state.clone();
-        state.update(cx, |state, cx| {
-            let full = state.text().to_string();
-            let starts = line_starts(&full);
-            let cursor = state.cursor();
-            let line = state.text().offset_to_position(state.cursor()).line as usize;
-            let line = line.min(starts.len().saturating_sub(1));
-            let line_start = starts[line];
-            let line_end = line_end(&starts, line, full.len());
-            let line_text = &full[line_start..line_end];
+        let range = self.current_range(window, cx);
+        let full = self.state.read(cx).text().to_string();
+        let (next, cursor) = toggle_prefixes(&full, range, prefix);
+        self.apply_document_edit(next, cursor, window, cx);
+    }
 
-            let (new_line, cursor_delta) = if prefix == "# " {
-                toggle_heading_line(line_text, cursor.saturating_sub(line_start))
-            } else {
-                toggle_block_prefix(line_text, &prefix, cursor.saturating_sub(line_start))
-            };
+    fn set_heading(&mut self, level: u8, window: &mut Window, cx: &mut Context<Self>) {
+        let range = self.current_range(window, cx);
+        let full = self.state.read(cx).text().to_string();
+        let (next, cursor) = set_heading_level(&full, range, level);
+        self.apply_document_edit(next, cursor, window, cx);
+    }
 
-            let range_utf16 = utf16_range_from_utf8(&full, line_start..line_end);
-            <InputState as EntityInputHandler>::replace_text_in_range(
-                state,
-                Some(range_utf16),
-                &new_line,
-                window,
-                cx,
-            );
-            let new_cursor = (line_start + cursor_delta).min(state.text().len());
-            let position = state.text().offset_to_position(new_cursor);
-            state.set_cursor_position(position, window, cx);
-        });
+    #[allow(dead_code)]
+    fn cycle_heading(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_line_prefix("# ", window, cx);
+    }
+
+    #[allow(dead_code)]
+    fn current_line(&self, cx: &App) -> String {
+        let full = self.state.read(cx).text().to_string();
+        let cursor = self.state.read(cx).cursor();
+        let starts = crate::editing::line_starts(&full);
+        let line = crate::editing::line_index(&starts, cursor);
+        let start = starts[line];
+        let end = crate::editing::line_end(&starts, line, full.len());
+        full[start..end].to_owned()
     }
 }
 
@@ -308,9 +372,11 @@ impl Render for MarkdownInput {
             .bordered(false)
             .focus_bordered(false)
             .text_color(rgb(TEXT))
-            .text_size(if self.multi_line { px(16.) } else { px(14.) });
+            .text_size(px(self.font_size));
         if self.multi_line {
-            input = input.h_full().line_height(px(28.));
+            input = input
+                .h_full()
+                .line_height(px((self.font_size * 1.75).round()));
         }
         div()
             .w_full()
@@ -339,81 +405,34 @@ fn subscribe_input_state(
     )
 }
 
-fn toggle_heading_line(line: &str, cursor_offset: usize) -> (String, usize) {
-    if let Some(rest) = line.strip_prefix("# ") {
-        let removed = line.len().saturating_sub(rest.len());
-        (rest.to_owned(), cursor_offset.saturating_sub(removed))
-    } else if line.starts_with('#') {
-        let rest = line.trim_start_matches('#').trim_start();
-        let title_offset = line.len().saturating_sub(rest.len());
-        let new_line = format!("# {rest}");
-        let cursor = if cursor_offset <= title_offset {
-            2.min(new_line.len())
-        } else {
-            2 + cursor_offset.saturating_sub(title_offset)
-        };
-        (new_line, cursor)
-    } else {
-        (format!("# {line}"), cursor_offset + 2)
-    }
-}
-
-/// 切换“列表 / 引用”类行前缀：已有相同前缀则移除，已有其他前缀则替换，
-/// 避免叠出 `- [ ] - xxx`、`- > xxx` 这类错误 Markdown。
-fn toggle_block_prefix(line: &str, prefix: &str, cursor_offset: usize) -> (String, usize) {
-    if let Some(rest) = exact_prefix_rest(line, prefix) {
-        return (rest.to_owned(), cursor_offset.saturating_sub(prefix.len()));
-    }
-
-    let (rest, removed) = strip_block_prefix(line);
-    let new_line = format!("{prefix}{rest}");
-    let cursor_delta = if cursor_offset <= removed {
-        prefix.len().min(new_line.len())
-    } else {
-        prefix.len() + (cursor_offset - removed)
-    };
-    (new_line, cursor_delta)
-}
-
-/// 仅当行的前缀与请求前缀完全一致时，返回去掉前缀后的剩余文本。
-/// `- ` 不能吞掉 `- [ ] ` / `- [x] ` 的任务标记。
-fn exact_prefix_rest<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
-    let rest = line.strip_prefix(prefix)?;
-    if prefix == "- "
-        && (rest.starts_with("[ ] ") || rest.starts_with("[x] ") || rest.starts_with("[X] "))
-    {
-        return None;
-    }
-    Some(rest)
-}
-
-/// 去掉一层常见块前缀（任务、无序、有序、引用），返回剩余文本与移除的字节数。
-fn strip_block_prefix(line: &str) -> (&str, usize) {
-    for prefix in ["- [ ] ", "- [x] ", "- [X] ", "- ", "* ", "+ ", "> "] {
-        if let Some(rest) = line.strip_prefix(prefix) {
-            return (rest, prefix.len());
-        }
-    }
-    // 有序列表：数字后跟 ". " 或 ") "。
-    let bytes = line.as_bytes();
-    let mut digits = 0;
-    while digits < bytes.len() && bytes[digits].is_ascii_digit() {
-        digits += 1;
-    }
-    if digits > 0
-        && let Some(rest) = line[digits..]
-            .strip_prefix(". ")
-            .or_else(|| line[digits..].strip_prefix(") "))
-    {
-        return (rest, digits + 2);
-    }
-    (line, 0)
-}
-
 impl Focusable for MarkdownInput {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.state.read(cx).focus_handle(cx)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EditorDialog {
+    None,
+    Link,
+    Table,
+    #[allow(dead_code)]
+    Heading,
+    PublishNotion,
+    PublishTypecho,
+    Drafts,
+    Recent,
+    #[allow(dead_code)]
+    Lightbox {
+        url: String,
+        alt: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishKind {
+    Notion,
+    Typecho,
 }
 
 struct MarkdownEditor {
@@ -423,12 +442,20 @@ struct MarkdownEditor {
     typecho_url_input: Entity<MarkdownInput>,
     typecho_username_input: Entity<MarkdownInput>,
     typecho_password_input: Entity<MarkdownInput>,
+    link_text_input: Entity<MarkdownInput>,
+    link_url_input: Entity<MarkdownInput>,
+    publish_title_input: Entity<MarkdownInput>,
     path: Option<PathBuf>,
     preview: bool,
+    workspace_mode: WorkspaceMode,
+    focus_mode: bool,
+    outline_visible: bool,
+    font_size: f32,
     active_tab: usize,
     split_ratio: f32,
     splitter_dragging: bool,
     settings_visible: bool,
+    dialog: EditorDialog,
     dirty: bool,
     status: SharedString,
     publish_settings: StoredPublishSettings,
@@ -439,6 +466,22 @@ struct MarkdownEditor {
     file_encoding: FileEncoding,
     last_draft_content: Option<String>,
     last_window_title: String,
+    last_backup_at: Option<u64>,
+    recent_files: Vec<PathBuf>,
+    drafts: Vec<DraftEntry>,
+    publishing: bool,
+    publish_update_existing: bool,
+    publish_public: bool,
+    document_meta: DocumentMeta,
+    pending_media: Vec<PathBuf>,
+    preview_source: SharedString,
+    preview_generation: u64,
+    editor_scroll: ScrollHandle,
+    preview_scroll: ScrollHandle,
+    last_editor_scroll: f32,
+    last_preview_scroll: f32,
+    table_rows: usize,
+    table_cols: usize,
     _content_subscription: gpui::Subscription,
 }
 
@@ -491,6 +534,14 @@ impl MarkdownEditor {
             Self::new_settings_input(window, cx, publish_settings.typecho_username.clone(), false);
         let typecho_password_input =
             Self::new_settings_input(window, cx, publish_settings.typecho_password.clone(), true);
+        let link_text_input = Self::new_settings_input(window, cx, String::new(), false);
+        let link_url_input = Self::new_settings_input(window, cx, String::new(), false);
+        let publish_title_input = Self::new_settings_input(window, cx, String::new(), false);
+        let prefs = storage::load_prefs();
+        text_input.update(cx, |input, cx| {
+            input.font_size = prefs.font_size;
+            cx.notify();
+        });
         let subscription = cx.observe(&text_input, |editor, input, cx| {
             if editor.suppress_observer {
                 return;
@@ -500,6 +551,7 @@ impl MarkdownEditor {
                 editor.last_observed_content = content;
                 editor.dirty = true;
                 editor.status = "正在编辑 · 尚未保存".into();
+                editor.schedule_preview(cx);
                 cx.notify();
             }
         });
@@ -510,21 +562,45 @@ impl MarkdownEditor {
             typecho_url_input,
             typecho_username_input,
             typecho_password_input,
+            link_text_input,
+            link_url_input,
+            publish_title_input,
             path: None,
-            preview: false,
+            preview: prefs.workspace_mode == WorkspaceMode::Preview,
+            workspace_mode: prefs.workspace_mode,
+            focus_mode: prefs.focus_mode,
+            outline_visible: prefs.outline_visible,
+            font_size: prefs.font_size,
             active_tab: 0,
-            split_ratio: 0.38,
+            split_ratio: prefs.split_ratio,
             splitter_dragging: false,
             settings_visible: false,
+            dialog: EditorDialog::None,
             dirty: false,
             status: "就绪 · Markdown 模式".into(),
-            last_observed_content: initial,
+            last_observed_content: initial.clone(),
             suppress_observer: false,
             close_confirmed: false,
             line_ending: "\n".to_owned(),
             file_encoding: FileEncoding::Utf8,
             last_draft_content: None,
             last_window_title: "Open Live Writer".to_owned(),
+            last_backup_at: storage::autosave_modified_secs(),
+            recent_files: storage::load_recent_files(),
+            drafts: storage::list_drafts(),
+            publishing: false,
+            publish_update_existing: false,
+            publish_public: true,
+            document_meta: DocumentMeta::default(),
+            pending_media: Vec::new(),
+            preview_source: initial.clone().into(),
+            preview_generation: 0,
+            editor_scroll: ScrollHandle::new(),
+            preview_scroll: ScrollHandle::new(),
+            last_editor_scroll: 0.,
+            last_preview_scroll: 0.,
+            table_rows: 2,
+            table_cols: 2,
             publish_settings,
             _content_subscription: subscription,
         };
@@ -547,8 +623,14 @@ impl MarkdownEditor {
                         if editor.last_draft_content.as_deref() == Some(content.as_str()) {
                             return;
                         }
-                        if let Err(error) = storage::save_autosave(&content) {
-                            eprintln!("自动备份失败：{error}");
+                        match storage::save_autosave(&content) {
+                            Ok(()) => {
+                                editor.last_draft_content = Some(content);
+                                editor.last_backup_at = storage::autosave_modified_secs();
+                            }
+                            Err(error) => eprintln!(
+                                "\u{81ea}\u{52a8}\u{5907}\u{4efd}\u{5931}\u{8d25}\u{ff1a}{error}"
+                            ),
                         }
                     }
                 });
@@ -578,6 +660,174 @@ impl MarkdownEditor {
 
     fn content(&self, cx: &App) -> String {
         self.text_input.read(cx).content.to_string()
+    }
+
+    fn persist_prefs(&self) {
+        let prefs = EditorPrefs {
+            split_ratio: self.split_ratio,
+            workspace_mode: self.workspace_mode,
+            font_size: self.font_size,
+            last_directory: self
+                .path
+                .as_ref()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .or_else(|| storage::load_prefs().last_directory),
+            outline_visible: self.outline_visible,
+            focus_mode: self.focus_mode,
+        };
+        let _ = storage::save_prefs(&prefs);
+    }
+
+    fn notify_window(
+        window: &mut Window,
+        cx: &mut App,
+        success: bool,
+        title: impl Into<SharedString>,
+        message: impl Into<SharedString>,
+    ) {
+        let notification = if success {
+            Notification::success(message).title(title)
+        } else {
+            Notification::error(message).title(title).autohide(false)
+        };
+        window.push_notification(notification, cx);
+    }
+
+    fn set_status(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.status = message.into();
+        cx.notify();
+    }
+
+    fn close_dialog(&mut self, cx: &mut Context<Self>) {
+        self.dialog = EditorDialog::None;
+        cx.notify();
+    }
+
+    fn apply_font_size(&mut self, cx: &mut Context<Self>) {
+        let size = self.font_size;
+        self.text_input.update(cx, |input, cx| {
+            input.font_size = size;
+            cx.notify();
+        });
+        self.persist_prefs();
+        cx.notify();
+    }
+
+    fn cycle_workspace(
+        &mut self,
+        _: &CycleWorkspace,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_visible = false;
+        self.workspace_mode = self.workspace_mode.cycle();
+        self.preview = self.workspace_mode == WorkspaceMode::Preview;
+        self.persist_prefs();
+        self.set_status(
+            format!("{} \u{6a21}\u{5f0f}", self.workspace_mode.label()),
+            cx,
+        );
+    }
+
+    #[allow(dead_code)]
+    fn set_workspace_mode(&mut self, mode: WorkspaceMode, cx: &mut Context<Self>) {
+        self.settings_visible = false;
+        self.workspace_mode = mode;
+        self.preview = mode == WorkspaceMode::Preview;
+        self.persist_prefs();
+        cx.notify();
+    }
+
+    fn toggle_focus(&mut self, _: &ToggleFocus, _window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_mode = !self.focus_mode;
+        self.persist_prefs();
+        self.set_status(
+            if self.focus_mode {
+                "\u{4e13}\u{6ce8}\u{6a21}\u{5f0f}"
+            } else {
+                "\u{5df2}\u{9000}\u{51fa}\u{4e13}\u{6ce8}\u{6a21}\u{5f0f}"
+            },
+            cx,
+        );
+    }
+
+    fn toggle_outline(&mut self, _: &ToggleOutline, _window: &mut Window, cx: &mut Context<Self>) {
+        self.outline_visible = !self.outline_visible;
+        self.persist_prefs();
+        cx.notify();
+    }
+
+    fn zoom_in(&mut self, _: &ZoomIn, _window: &mut Window, cx: &mut Context<Self>) {
+        self.font_size = (self.font_size + 1.).min(28.);
+        self.apply_font_size(cx);
+    }
+
+    fn zoom_out(&mut self, _: &ZoomOut, _window: &mut Window, cx: &mut Context<Self>) {
+        self.font_size = (self.font_size - 1.).max(12.);
+        self.apply_font_size(cx);
+    }
+
+    fn zoom_reset(&mut self, _: &ZoomReset, _window: &mut Window, cx: &mut Context<Self>) {
+        self.font_size = 16.;
+        self.apply_font_size(cx);
+    }
+
+    fn schedule_preview(&mut self, cx: &mut Context<Self>) {
+        let content = self.content(cx);
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        let generation = self.preview_generation;
+        cx.spawn(async move |editor, cx| {
+            gpui::Timer::after(std::time::Duration::from_millis(80)).await;
+            let _ = editor.update(cx, |editor, cx| {
+                if editor.preview_generation == generation {
+                    editor.preview_source = content.into();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn sync_scroll_offsets(&mut self) {
+        let editor_y: f32 = self.editor_scroll.offset().y.into();
+        let preview_y: f32 = self.preview_scroll.offset().y.into();
+        let editor_max: f32 = self.editor_scroll.max_offset().height.into();
+        let preview_max: f32 = self.preview_scroll.max_offset().height.into();
+        if (editor_y - self.last_editor_scroll).abs() > 1. && editor_max > 1. && preview_max > 1. {
+            let ratio = (editor_y / editor_max).clamp(0., 1.);
+            self.preview_scroll
+                .set_offset(point(px(0.), px(preview_max * ratio)));
+            self.last_editor_scroll = editor_y;
+            self.last_preview_scroll = preview_max * ratio;
+        } else if (preview_y - self.last_preview_scroll).abs() > 1.
+            && editor_max > 1.
+            && preview_max > 1.
+        {
+            let ratio = (preview_y / preview_max).clamp(0., 1.);
+            self.editor_scroll
+                .set_offset(point(px(0.), px(editor_max * ratio)));
+            self.last_preview_scroll = preview_y;
+            self.last_editor_scroll = editor_max * ratio;
+        }
+    }
+
+    fn jump_to_offset(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.text_input.update(cx, |input, cx| {
+            input.state.update(cx, |state, cx| {
+                let offset = offset.min(state.text().len());
+                let position = state.text().offset_to_position(offset);
+                state.set_cursor_position(position, window, cx);
+            });
+        });
+        self.workspace_mode = WorkspaceMode::Split;
+        self.preview = false;
+        cx.notify();
+    }
+
+    fn word_status(&self, cx: &App) -> String {
+        let content = self.content(cx);
+        let chars = character_count(&content);
+        format!("{chars} \u{5b57}")
     }
 
     fn toggle_settings(
@@ -677,10 +927,22 @@ impl MarkdownEditor {
         self.last_observed_content = content;
         self.line_ending = line_ending;
         self.file_encoding = encoding;
-        self.path = path;
+        self.path = path.clone();
         self.dirty = false;
         self.close_confirmed = false;
         self.last_draft_content = None;
+        self.document_meta = path
+            .as_ref()
+            .map(|path| storage::load_document_meta(path))
+            .unwrap_or_default();
+        if let Some(path) = path.as_ref() {
+            if let Ok(recent) = storage::remember_recent_file(path) {
+                self.recent_files = recent;
+            }
+            self.persist_prefs();
+        }
+        self.pending_media.clear();
+        self.preview_source = self.last_observed_content.clone().into();
         self.status = "已加载 · Markdown".into();
         let _ = storage::clear_autosave();
         cx.notify();
@@ -727,6 +989,7 @@ impl MarkdownEditor {
             Ok(path) => {
                 let _ = storage::clear_autosave();
                 self.last_draft_content = Some(content);
+                self.drafts = storage::list_drafts();
                 self.status =
                     format!("草稿已保存 · {} · 尚未保存为文件", display_path(&path)).into()
             }
@@ -754,13 +1017,55 @@ impl MarkdownEditor {
     }
 
     fn open_draft_now(&mut self, cx: &mut Context<Self>) {
-        match storage::load_draft() {
-            Ok(Some((path, content))) => {
+        self.drafts = storage::list_drafts();
+        if self.drafts.is_empty() {
+            self.status = "\u{6682}\u{65e0}\u{672c}\u{5730}\u{8349}\u{7a3f}".into();
+            cx.notify();
+            return;
+        }
+        self.dialog = EditorDialog::Drafts;
+        cx.notify();
+    }
+
+    fn load_named_draft(&mut self, id: &str, cx: &mut Context<Self>) {
+        match storage::load_named_draft(id) {
+            Ok(Some((entry, content))) => {
                 self.replace_document(None, LoadedDocument::new(content, FileEncoding::Utf8), cx);
-                self.status = format!("已打开草稿 · {}", display_path(&path)).into();
+                self.dialog = EditorDialog::None;
+                self.status = format!(
+                    "\u{5df2}\u{6253}\u{5f00}\u{8349}\u{7a3f} \u{00b7} {}",
+                    entry.title
+                )
+                .into();
             }
-            Ok(None) => self.status = "暂无本地草稿".into(),
-            Err(error) => self.status = format!("草稿打开失败：{error}").into(),
+            Ok(None) => self.status = "\u{8349}\u{7a3f}\u{4e0d}\u{5b58}\u{5728}".into(),
+            Err(error) => self.status = format!("draft error: {error}").into(),
+        }
+        cx.notify();
+    }
+
+    fn show_recent(&mut self, _: &ShowRecent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.recent_files = storage::load_recent_files();
+        self.dialog = EditorDialog::Recent;
+        cx.notify();
+    }
+
+    fn show_drafts(&mut self, _: &ShowDrafts, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_draft(&OpenDraft, window, cx);
+    }
+
+    fn open_recent_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        match fs::read(&path) {
+            Ok(bytes) => match decode_markdown(&bytes) {
+                Ok(document) => {
+                    self.dialog = EditorDialog::None;
+                    self.replace_document(Some(path), document, cx);
+                }
+                Err(message) => self.status = message.into(),
+            },
+            Err(error) => {
+                self.status = format!("\u{6253}\u{5f00}\u{5931}\u{8d25}\u{ff1a}{error}").into()
+            }
         }
         cx.notify();
     }
@@ -894,7 +1199,27 @@ impl MarkdownEditor {
     }
 
     fn save_to(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
-        let editor_content = self.content(cx);
+        let mut editor_content = self.content(cx);
+        if !self.pending_media.is_empty() {
+            match storage::relocate_pending_media(&editor_content, &path, &self.pending_media) {
+                Ok((rewritten, relocated)) => {
+                    editor_content = rewritten;
+                    self.pending_media.clear();
+                    let _ = relocated;
+                    self.suppress_observer = true;
+                    self.text_input.update(cx, |input, cx| {
+                        input.set_document_content(editor_content.clone(), cx)
+                    });
+                    self.suppress_observer = false;
+                    self.last_observed_content = editor_content.clone();
+                }
+                Err(error) => {
+                    self.status = format!("\u{56fe}\u{7247}\u{8d44}\u{6e90}\u{5b89}\u{7f6e}\u{5931}\u{8d25}\u{ff1a}{error}").into();
+                    cx.notify();
+                    return false;
+                }
+            }
+        }
         let disk_content = editor_content.replace('\n', &self.line_ending);
         let bytes = match encode_markdown(&disk_content, self.file_encoding) {
             Ok(bytes) => bytes,
@@ -909,6 +1234,11 @@ impl MarkdownEditor {
                 self.path = Some(path.clone());
                 self.dirty = false;
                 self.last_observed_content = editor_content;
+                if let Ok(recent) = storage::remember_recent_file(&path) {
+                    self.recent_files = recent;
+                }
+                let _ = storage::save_document_meta(&path, &self.document_meta);
+                self.persist_prefs();
                 self.status = format!("已保存 · {}", display_path(&path)).into();
                 let _ = storage::clear_autosave();
                 cx.notify();
@@ -948,23 +1278,36 @@ impl MarkdownEditor {
         self.save_document(&SaveDocument, window, cx);
     }
 
-    fn toggle_preview(&mut self, _: &TogglePreview, _window: &mut Window, cx: &mut Context<Self>) {
+    fn save_as_document(
+        &mut self,
+        _: &SaveAsDocument,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.settings_visible = false;
-        self.preview = !self.preview;
-        self.status = if self.preview {
-            if self.dirty {
-                "预览模式 · 尚未保存".into()
-            } else {
-                "预览模式 · Markdown 已渲染".into()
-            }
-        } else {
-            if self.dirty {
-                "编辑模式 · 尚未保存".into()
-            } else {
-                "编辑模式 · Markdown 源文".into()
-            }
-        };
-        cx.notify();
+        let suggested_name = self
+            .path
+            .as_ref()
+            .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| default_markdown_filename(&self.content(cx)));
+        let directory = self
+            .path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(default_save_directory);
+        let receiver = cx.prompt_for_new_path(&directory, Some(&suggested_name));
+        cx.spawn(async move |editor, cx| {
+            let Ok(Ok(Some(path))) = receiver.await else {
+                return;
+            };
+            let _ = editor.update(cx, |editor, cx| editor.save_to(path, cx));
+        })
+        .detach();
+    }
+
+    fn toggle_preview(&mut self, _: &TogglePreview, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_workspace(&CycleWorkspace, window, cx);
     }
 
     fn toggle_preview_click(
@@ -1059,47 +1402,112 @@ impl MarkdownEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let _ = window;
+        self.open_publish_dialog(PublishKind::Notion, cx);
+    }
+
+    fn open_publish_dialog(&mut self, kind: PublishKind, cx: &mut Context<Self>) {
+        if self.publishing {
+            self.status = "\u{6b63}\u{5728}\u{53d1}\u{5e03}\u{ff0c}\u{8bf7}\u{7a0d}\u{5019}".into();
+            cx.notify();
+            return;
+        }
         self.settings_visible = false;
         let markdown = self.content(cx);
-        let title = document_title(&markdown);
+        self.publish_title_input.update(cx, |input, cx| {
+            input.set_content(document_title(&markdown), cx)
+        });
+        self.publish_update_existing = match kind {
+            PublishKind::Notion => self.document_meta.notion_page_id.is_some(),
+            PublishKind::Typecho => self.document_meta.typecho_post_id.is_some(),
+        };
+        self.publish_public = true;
+        self.dialog = match kind {
+            PublishKind::Notion => EditorDialog::PublishNotion,
+            PublishKind::Typecho => EditorDialog::PublishTypecho,
+        };
+        cx.notify();
+    }
+
+    fn confirm_publish(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dialog = self.dialog.clone();
+        self.dialog = EditorDialog::None;
+        match dialog {
+            EditorDialog::PublishNotion => self.execute_notion_publish(window, cx),
+            EditorDialog::PublishTypecho => self.execute_typecho_publish(window, cx),
+            _ => {}
+        }
+    }
+
+    fn copy_markdown_only(&mut self, cx: &mut Context<Self>) {
+        let markdown = self.content(cx);
+        cx.write_to_clipboard(ClipboardItem::new_string(markdown));
+        self.dialog = EditorDialog::None;
+        self.status = "Markdown \u{5df2}\u{590d}\u{5236}".into();
+        cx.notify();
+    }
+
+    fn execute_notion_publish(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.publishing {
+            return;
+        }
+        self.settings_visible = false;
+        let markdown = self.content(cx);
+        let title = {
+            let value = self.publish_title_input.read(cx).content.trim().to_owned();
+            if value.is_empty() {
+                document_title(&markdown)
+            } else {
+                value
+            }
+        };
         let warning = local_image_warning(&markdown);
         if let Some(config) =
             NotionConfig::from_env().or_else(|| self.publish_settings.notion_config())
         {
             let http = cx.http_client();
             let window_handle = window.window_handle();
+            self.publishing = true;
             self.status = format!("正在发布到 Notion…{warning}").into();
             cx.notify();
             cx.spawn(async move |editor, cx| {
                 match publish_notion_request(http, config, &title, &markdown).await {
                     Ok(page) => {
-                        let url = page.url;
-                        let _ = cx.update(|app| app.open_url(&url));
-                        let _ = cx.update(|app| {
-                            app.write_to_clipboard(ClipboardItem::new_string(url.clone()))
-                        });
+                        let url = page.url.clone();
+                        let page_id = page.id.clone();
                         let _ = editor.update(cx, |editor, cx| {
-                            editor.status =
-                                format!("已发布到 Notion{warning} · 链接已复制：{url}").into();
+                            editor.publishing = false;
+                            editor.document_meta.notion_page_id = Some(page_id);
+                            editor.document_meta.notion_url = Some(url.clone());
+                            if let Some(path) = editor.path.as_ref() {
+                                let _ = storage::save_document_meta(path, &editor.document_meta);
+                            }
+                            editor.status = format!("已发布到 Notion{warning} · {url}").into();
                             cx.notify();
+                        });
+                        let _ = window_handle.update(cx, |_, window, cx| {
+                            MarkdownEditor::notify_window(
+                                window,
+                                cx,
+                                true,
+                                "Notion",
+                                format!("发布成功，点击通知打开：{url}"),
+                            );
                         });
                     }
                     Err(error) => {
                         let message = format!("Notion 发布失败：{error}");
                         let _ = window_handle.update(cx, |_, window, cx| {
-                            let answer = window.prompt(
-                                PromptLevel::Warning,
-                                "发布失败",
-                                Some(&message),
-                                &["确定"],
+                            MarkdownEditor::notify_window(
+                                window,
                                 cx,
+                                false,
+                                "Notion",
+                                message.clone(),
                             );
-                            cx.spawn(async move |_| {
-                                let _ = answer.await;
-                            })
-                            .detach();
                         });
                         let _ = editor.update(cx, |editor, cx| {
+                            editor.publishing = false;
                             editor.status = message.into();
                             cx.notify();
                         });
@@ -1108,8 +1516,9 @@ impl MarkdownEditor {
             })
             .detach();
         } else {
-            cx.write_to_clipboard(ClipboardItem::new_string(markdown));
-            self.status = "未配置 Notion，Markdown 已复制 · 粘贴即可发布".into();
+            self.publishing = false;
+            self.settings_visible = true;
+            self.status = "未配置 Notion，请先填写发布设置；也可复制 Markdown".into();
             cx.notify();
         }
     }
@@ -1129,21 +1538,57 @@ impl MarkdownEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let _ = window;
+        self.open_publish_dialog(PublishKind::Typecho, cx);
+    }
+
+    fn execute_typecho_publish(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.publishing {
+            return;
+        }
         self.settings_visible = false;
         let markdown = self.content(cx);
-        let title = document_title(&markdown);
+        let title = {
+            let value = self.publish_title_input.read(cx).content.trim().to_owned();
+            if value.is_empty() {
+                document_title(&markdown)
+            } else {
+                value
+            }
+        };
         let warning = local_image_warning(&markdown);
+        let existing_id = if self.publish_update_existing {
+            self.document_meta.typecho_post_id.clone()
+        } else {
+            None
+        };
+        let publish_public = self.publish_public;
         if let Some(config) =
             TypechoConfig::from_env().or_else(|| self.publish_settings.typecho_config())
         {
             let http = cx.http_client();
             let window_handle = window.window_handle();
+            self.publishing = true;
             self.status = format!("正在发布到 Typecho…{warning}").into();
             cx.notify();
             cx.spawn(async move |editor, cx| {
-                match publish_typecho_request(http, config, &title, &markdown).await {
+                match publish_or_update_typecho(
+                    http,
+                    config,
+                    &title,
+                    &markdown,
+                    existing_id.as_deref(),
+                    publish_public,
+                )
+                .await
+                {
                     Ok(post_id) => {
                         let _ = editor.update(cx, |editor, cx| {
+                            editor.publishing = false;
+                            editor.document_meta.typecho_post_id = Some(post_id.clone());
+                            if let Some(path) = editor.path.as_ref() {
+                                let _ = storage::save_document_meta(path, &editor.document_meta);
+                            }
                             editor.status =
                                 format!("已提交到 Typecho{warning} · 文章 ID：{post_id}").into();
                             cx.notify();
@@ -1152,19 +1597,16 @@ impl MarkdownEditor {
                     Err(error) => {
                         let message = format!("Typecho 发布失败：{error}");
                         let _ = window_handle.update(cx, |_, window, cx| {
-                            let answer = window.prompt(
-                                PromptLevel::Warning,
-                                "发布失败",
-                                Some(&message),
-                                &["确定"],
+                            MarkdownEditor::notify_window(
+                                window,
                                 cx,
+                                false,
+                                "Typecho",
+                                message.clone(),
                             );
-                            cx.spawn(async move |_| {
-                                let _ = answer.await;
-                            })
-                            .detach();
                         });
                         let _ = editor.update(cx, |editor, cx| {
+                            editor.publishing = false;
                             editor.status = message.into();
                             cx.notify();
                         });
@@ -1174,7 +1616,8 @@ impl MarkdownEditor {
             .detach();
         } else {
             cx.write_to_clipboard(ClipboardItem::new_string(markdown));
-            self.status = "未配置 Typecho，Markdown 已复制".into();
+            self.settings_visible = true;
+            self.status = "未配置 Typecho，请先填写发布设置".into();
             cx.notify();
         }
     }
@@ -1239,11 +1682,76 @@ impl MarkdownEditor {
     }
 
     fn link_action(&mut self, _: &LinkText, window: &mut Window, cx: &mut Context<Self>) {
-        self.apply_format(
-            "[",
-            "](https://example.com)",
-            "已插入链接 Markdown",
-            window,
+        self.settings_visible = false;
+        let selected = self.text_input.update(cx, |input, cx| {
+            let range = input.current_range(window, cx);
+            let full = input.state.read(cx).text().to_string();
+            if range.start < range.end && range.end <= full.len() {
+                full[range.start..range.end].to_owned()
+            } else {
+                String::new()
+            }
+        });
+        let clipboard = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        let url = if is_clipboard_url(&clipboard) {
+            normalize_url(&clipboard)
+        } else if looks_like_url(&selected) {
+            normalize_url(&selected)
+        } else {
+            String::new()
+        };
+        let label = if looks_like_url(&selected) {
+            String::new()
+        } else {
+            selected
+        };
+        self.link_text_input
+            .update(cx, |input, cx| input.set_content(label, cx));
+        self.link_url_input
+            .update(cx, |input, cx| input.set_content(url, cx));
+        self.dialog = EditorDialog::Link;
+        cx.notify();
+    }
+
+    fn confirm_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let label = self.link_text_input.read(cx).content.to_string();
+        let url = self.link_url_input.read(cx).content.to_string();
+        let snippet = markdown_link(&label, &url);
+        self.dialog = EditorDialog::None;
+        self.text_input.update(cx, |input, cx| {
+            input.queue_insert(snippet, cx);
+        });
+        self.status = "\u{5df2}\u{63d2}\u{5165}\u{94fe}\u{63a5}".into();
+        let _ = window;
+        cx.notify();
+    }
+
+    fn heading_menu(&mut self, cx: &mut Context<Self>) {
+        self.settings_visible = false;
+        self.dialog = EditorDialog::Heading;
+        cx.notify();
+    }
+
+    fn apply_heading_level(&mut self, level: u8, window: &mut Window, cx: &mut Context<Self>) {
+        self.dialog = EditorDialog::None;
+        self.text_input
+            .update(cx, |input, cx| input.set_heading(level, window, cx));
+        self.status = "\u{5df2}\u{66f4}\u{65b0}\u{6807}\u{9898}".into();
+        cx.notify();
+    }
+
+    fn code_block_action(
+        &mut self,
+        _: &CodeBlockText,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.insert_snippet(
+            markdown_code_block(""),
+            "\u{5df2}\u{63d2}\u{5165}\u{4ee3}\u{7801}\u{5757}",
             cx,
         );
     }
@@ -1270,49 +1778,143 @@ impl MarkdownEditor {
         );
     }
 
+    fn insert_local_image(&mut self, source: PathBuf, cx: &mut Context<Self>) {
+        if !is_image_path(&source) {
+            self.status = "\u{8bf7}\u{9009}\u{62e9} PNG\u{3001}JPEG\u{3001}GIF\u{3001}WebP\u{3001}SVG \u{6216} BMP \u{56fe}\u{7247}".into();
+            cx.notify();
+            return;
+        }
+        let bytes = match fs::read(&source) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status =
+                    format!("\u{8bfb}\u{53d6}\u{56fe}\u{7247}\u{5931}\u{8d25}\u{ff1a}{error}")
+                        .into();
+                cx.notify();
+                return;
+            }
+        };
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image.png");
+        self.insert_image_bytes(name, &bytes, cx);
+    }
+
+    fn insert_image_bytes(&mut self, file_name: &str, bytes: &[u8], cx: &mut Context<Self>) {
+        let dest_dir = if let Some(path) = self.path.as_ref() {
+            storage::media_dir_for_document(path)
+        } else {
+            match storage::ensure_pending_media_dir() {
+                Ok(dir) => dir,
+                Err(error) => {
+                    self.status = format!("\u{65e0}\u{6cd5}\u{521b}\u{5efa}\u{56fe}\u{7247}\u{76ee}\u{5f55}\u{ff1a}{error}").into();
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        match storage::save_media_bytes(&dest_dir, file_name, bytes) {
+            Ok(saved) => {
+                if self.path.is_none() {
+                    self.pending_media.push(saved.clone());
+                }
+                let url = storage::relative_media_url(self.path.as_deref(), &saved);
+                let snippet = format!("![\u{56fe}\u{7247}]({url})");
+                self.insert_snippet(snippet, "\u{5df2}\u{63d2}\u{5165}\u{56fe}\u{7247}", cx);
+            }
+            Err(error) => {
+                self.status =
+                    format!("\u{56fe}\u{7247}\u{4fdd}\u{5b58}\u{5931}\u{8d25}\u{ff1a}{error}")
+                        .into();
+                cx.notify();
+            }
+        }
+    }
+
     fn image_action(&mut self, _: &ImageText, _window: &mut Window, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
-            multiple: false,
-            prompt: Some("选择图片文件".into()),
+            multiple: true,
+            prompt: Some("\u{9009}\u{62e9}\u{56fe}\u{7247}\u{6587}\u{4ef6}".into()),
         });
         cx.spawn(async move |editor, cx| {
             let Ok(Ok(Some(paths))) = receiver.await else {
                 return;
             };
-            let Some(path) = paths.into_iter().next() else {
-                return;
-            };
-            if !is_image_path(&path) {
-                let _ = editor.update(cx, |editor, cx| {
-                    editor.status = "请选择 PNG、JPEG、GIF、WebP、SVG 或 BMP 图片".into();
-                    cx.notify();
-                });
-                return;
-            }
-            let snippet = format!("![图片]({})", markdown_image_url(&path));
             let _ = editor.update(cx, |editor, cx| {
-                editor.insert_snippet(snippet, "已插入本地图片 Markdown", cx);
+                for path in paths {
+                    editor.insert_local_image(path, cx);
+                }
             });
         })
         .detach();
     }
 
+    fn paste_image(&mut self, _: &PasteImage, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(item) = cx.read_from_clipboard() {
+            for entry in item.entries() {
+                if let ClipboardEntry::Image(image) = entry {
+                    let ext = match image.format {
+                        ImageFormat::Png => "png",
+                        ImageFormat::Jpeg => "jpg",
+                        ImageFormat::Gif => "gif",
+                        ImageFormat::Webp => "webp",
+                        ImageFormat::Bmp => "bmp",
+                        ImageFormat::Tiff => "tiff",
+                        ImageFormat::Svg => "svg",
+                    };
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let name = format!("paste-{stamp}.{ext}");
+                    self.insert_image_bytes(&name, &image.bytes, cx);
+                    return;
+                }
+            }
+        }
+        window.dispatch_action(Box::new(gpui_component::input::Paste), cx);
+    }
+
+    fn drop_images(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
+        for path in paths.paths() {
+            if is_image_path(path) {
+                self.insert_local_image(path.clone(), cx);
+            } else if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+            {
+                self.status = "\u{62d6}\u{5165}\u{7684} Markdown \u{8bf7}\u{7528}\u{6253}\u{5f00}\u{6253}\u{5f00}".into();
+                cx.notify();
+            }
+        }
+    }
+
     fn table_action(&mut self, _: &TableText, _window: &mut Window, cx: &mut Context<Self>) {
-        self.insert_snippet(
-            "| 列 1 | 列 2 |\n| --- | --- |\n| 内容 | 内容 |".to_owned(),
-            "已插入 Markdown 表格",
-            cx,
-        );
+        self.settings_visible = false;
+        self.dialog = EditorDialog::Table;
+        cx.notify();
+    }
+
+    fn insert_chosen_table(&mut self, cx: &mut Context<Self>) {
+        let snippet = markdown_table(self.table_rows, self.table_cols);
+        self.dialog = EditorDialog::None;
+        self.insert_snippet(snippet, "\u{5df2}\u{63d2}\u{5165}\u{8868}\u{683c}", cx);
     }
 
     fn video_action(&mut self, _: &VideoText, _window: &mut Window, cx: &mut Context<Self>) {
-        self.insert_snippet(
-            "[视频](https://example.com/video)".to_owned(),
-            "已插入视频链接 Markdown",
-            cx,
-        );
+        self.settings_visible = false;
+        self.link_text_input
+            .update(cx, |input, cx| input.set_content("\u{89c6}\u{9891}", cx));
+        let clip = String::new();
+        self.link_url_input
+            .update(cx, |input, cx| input.set_content(clip, cx));
+        self.dialog = EditorDialog::Link;
+        self.status = "\u{63d2}\u{5165}\u{89c6}\u{9891}\u{94fe}\u{63a5}".into();
+        cx.notify();
     }
 
     fn divider_action(&mut self, _: &DividerText, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1400,6 +2002,7 @@ impl MarkdownEditor {
         if event.button == MouseButton::Left && self.splitter_dragging {
             self.splitter_dragging = false;
             window.set_window_cursor_style(CursorStyle::Arrow);
+            self.persist_prefs();
             cx.notify();
         }
     }
@@ -1597,8 +2200,8 @@ impl MarkdownEditor {
                             ribbon_small_button(
                                 "icons/heading.png",
                                 "标题",
-                                cx.listener(|editor, event, window, cx| {
-                                    editor.prefix_button("# ", "已切换标题", event, window, cx)
+                                cx.listener(|editor, _event, _window, cx| {
+                                    editor.heading_menu(cx)
                                 }),
                             ),
                             ribbon_small_button(
@@ -1704,9 +2307,7 @@ impl MarkdownEditor {
                         ribbon_large_button(
                             "icons/html-large.png",
                             "标题",
-                            cx.listener(|editor, event, window, cx| {
-                                editor.prefix_button("# ", "已切换标题", event, window, cx)
-                            }),
+                            cx.listener(|editor, _event, _window, cx| { editor.heading_menu(cx) }),
                         ),
                         ribbon_stack!(
                             ribbon_small_button(
@@ -1953,6 +2554,633 @@ impl MarkdownEditor {
                 .into_any_element(),
         }
     }
+
+    fn heading2_action(&mut self, _: &Heading2Text, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_heading_level(2, window, cx);
+    }
+
+    fn heading3_action(&mut self, _: &Heading3Text, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_heading_level(3, window, cx);
+    }
+
+    fn test_notion_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = StoredPublishSettings {
+            notion_token: self.notion_token_input.read(cx).content.trim().to_owned(),
+            notion_parent_page_id: self.notion_parent_input.read(cx).content.trim().to_owned(),
+            typecho_xmlrpc_url: self.typecho_url_input.read(cx).content.trim().to_owned(),
+            typecho_username: self
+                .typecho_username_input
+                .read(cx)
+                .content
+                .trim()
+                .to_owned(),
+            typecho_password: self.typecho_password_input.read(cx).content.to_string(),
+        };
+        let Some(config) = NotionConfig::from_env().or_else(|| settings.notion_config()) else {
+            self.status = "\u{5c1a}\u{672a}\u{914d}\u{7f6e} Notion".into();
+            cx.notify();
+            return;
+        };
+        let from_env = NotionConfig::from_env().is_some();
+        let http = cx.http_client();
+        let window_handle = window.window_handle();
+        self.status = "\u{6b63}\u{5728}\u{6d4b}\u{8bd5} Notion\u{2026}".into();
+        cx.notify();
+        cx.spawn(
+            async move |editor, cx| match test_notion_connection(http, config).await {
+                Ok(name) => {
+                    let message = if from_env {
+                        format!("Notion OK (env): {name}")
+                    } else {
+                        format!("Notion OK: {name}")
+                    };
+                    let _ = editor.update(cx, |editor, cx| {
+                        editor.status = message.clone().into();
+                        cx.notify();
+                    });
+                    let _ = window_handle.update(cx, |_, window, cx| {
+                        MarkdownEditor::notify_window(window, cx, true, "Notion", message);
+                    });
+                }
+                Err(error) => {
+                    let message = format!("Notion test failed: {error}");
+                    let _ = editor.update(cx, |editor, cx| {
+                        editor.status = message.clone().into();
+                        cx.notify();
+                    });
+                    let _ = window_handle.update(cx, |_, window, cx| {
+                        MarkdownEditor::notify_window(window, cx, false, "Notion", message);
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn test_typecho_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = StoredPublishSettings {
+            notion_token: self.notion_token_input.read(cx).content.trim().to_owned(),
+            notion_parent_page_id: self.notion_parent_input.read(cx).content.trim().to_owned(),
+            typecho_xmlrpc_url: self.typecho_url_input.read(cx).content.trim().to_owned(),
+            typecho_username: self
+                .typecho_username_input
+                .read(cx)
+                .content
+                .trim()
+                .to_owned(),
+            typecho_password: self.typecho_password_input.read(cx).content.to_string(),
+        };
+        let Some(config) = TypechoConfig::from_env().or_else(|| settings.typecho_config()) else {
+            self.status = "\u{5c1a}\u{672a}\u{914d}\u{7f6e} Typecho".into();
+            cx.notify();
+            return;
+        };
+        let from_env = TypechoConfig::from_env().is_some();
+        let http = cx.http_client();
+        let window_handle = window.window_handle();
+        self.status = "\u{6b63}\u{5728}\u{6d4b}\u{8bd5} Typecho\u{2026}".into();
+        cx.notify();
+        cx.spawn(
+            async move |editor, cx| match test_typecho_connection(http, config).await {
+                Ok(name) => {
+                    let message = if from_env {
+                        format!("Typecho OK (env): {name}")
+                    } else {
+                        format!("Typecho OK: {name}")
+                    };
+                    let _ = editor.update(cx, |editor, cx| {
+                        editor.status = message.clone().into();
+                        cx.notify();
+                    });
+                    let _ = window_handle.update(cx, |_, window, cx| {
+                        MarkdownEditor::notify_window(window, cx, true, "Typecho", message);
+                    });
+                }
+                Err(error) => {
+                    let message = format!("Typecho test failed: {error}");
+                    let _ = editor.update(cx, |editor, cx| {
+                        editor.status = message.clone().into();
+                        cx.notify();
+                    });
+                    let _ = window_handle.update(cx, |_, window, cx| {
+                        MarkdownEditor::notify_window(window, cx, false, "Typecho", message);
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn outline_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let content = self.content(cx);
+        let items = document_outline(&content);
+        let mut list = div()
+            .id("document-outline")
+            .flex()
+            .flex_col()
+            .flex_grow()
+            .min_h_0()
+            .overflow_y_scroll()
+            .gap_1()
+            .p_2();
+        if items.is_empty() {
+            list = list.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("\u{6682}\u{65e0}\u{6807}\u{9898}"),
+            );
+        }
+        for (index, item) in items.into_iter().enumerate() {
+            let offset = item.offset;
+            let title = if item.title.is_empty() {
+                format!("H{}", item.level)
+            } else {
+                item.title
+            };
+            list = list.child(
+                div()
+                    .id(("outline-item", index))
+                    .pl(px(8. + (item.level.saturating_sub(1) as f32) * 10.))
+                    .py_1()
+                    .rounded_sm()
+                    .text_xs()
+                    .hover(|style| style.bg(rgb(0xe7f0f9)).cursor_pointer())
+                    .on_click(cx.listener(move |editor, _, window, cx| {
+                        editor.jump_to_offset(offset, window, cx);
+                    }))
+                    .child(title),
+            );
+        }
+        div()
+            .w(px(196.))
+            .h_full()
+            .flex()
+            .flex_none()
+            .flex_col()
+            .bg(white())
+            .border_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .h(px(32.))
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .bg(rgb(0xf4f7fa))
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child("\u{5927}\u{7eb2}"),
+            )
+            .child(list)
+            .into_any_element()
+    }
+
+    fn dialog_layer(&self, cx: &mut Context<Self>) -> AnyElement {
+        let card = match &self.dialog {
+            EditorDialog::None => return div().into_any_element(),
+            EditorDialog::Link => self.link_dialog(cx),
+            EditorDialog::Table => self.table_dialog(cx),
+            EditorDialog::Heading => self.heading_dialog(cx),
+            EditorDialog::PublishNotion => self.publish_dialog(PublishKind::Notion, cx),
+            EditorDialog::PublishTypecho => self.publish_dialog(PublishKind::Typecho, cx),
+            EditorDialog::Drafts => self.drafts_dialog(cx),
+            EditorDialog::Recent => self.recent_dialog(cx),
+            EditorDialog::Lightbox { url, alt } => self.lightbox_dialog(url, alt),
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(hsla(0., 0., 0., 0.32))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|editor, _, _, cx| editor.close_dialog(cx)),
+            )
+            .child(
+                div()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(card),
+            )
+            .into_any_element()
+    }
+
+    fn dialog_card(title: &'static str, body: impl IntoElement) -> impl IntoElement {
+        div()
+            .w(px(460.))
+            .max_w(px(560.))
+            .bg(white())
+            .border_1()
+            .border_color(rgb(BORDER))
+            .shadow_sm()
+            .p_5()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight(700.))
+                    .text_color(rgb(DARK_BLUE))
+                    .child(title),
+            )
+            .child(body)
+    }
+
+    fn dialog_button(
+        id: &'static str,
+        label: &'static str,
+        primary: bool,
+        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .px_3()
+            .py_2()
+            .rounded_sm()
+            .bg(rgb(if primary { BLUE } else { 0xd7e2ec }))
+            .text_color(rgb(if primary { 0xffffff } else { TEXT }))
+            .hover(|style| {
+                style
+                    .bg(rgb(if primary { DARK_BLUE } else { 0xc8d7e5 }))
+                    .cursor_pointer()
+            })
+            .on_click(on_click)
+            .child(label)
+    }
+
+    fn link_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        Self::dialog_card(
+            "\u{63d2}\u{5165}\u{94fe}\u{63a5}",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(settings_field(
+                    "\u{6587}\u{5b57}",
+                    "\u{7559}\u{7a7a}\u{5219}\u{4f7f}\u{7528}\u{5730}\u{5740}",
+                    self.link_text_input.clone(),
+                ))
+                .child(settings_field(
+                    "\u{5730}\u{5740}",
+                    "https://...",
+                    self.link_url_input.clone(),
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(Self::dialog_button(
+                            "cancel-link",
+                            "\u{53d6}\u{6d88}",
+                            false,
+                            cx.listener(|editor, _, _, cx| editor.close_dialog(cx)),
+                        ))
+                        .child(Self::dialog_button(
+                            "confirm-link",
+                            "\u{63d2}\u{5165}",
+                            true,
+                            cx.listener(|editor, _, window, cx| editor.confirm_link(window, cx)),
+                        )),
+                ),
+        )
+        .into_any_element()
+    }
+
+    fn table_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut grid = div().flex().flex_col().gap_1();
+        for rows in 1..=5 {
+            let mut row = div().flex().gap_1();
+            for cols in 1..=5 {
+                let active = self.table_rows == rows && self.table_cols == cols;
+                row = row.child(
+                    div()
+                        .id(("table-size", rows * 10 + cols))
+                        .w(px(36.))
+                        .h(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .border_1()
+                        .border_color(rgb(if active { BLUE } else { BORDER }))
+                        .bg(rgb(if active { 0xd9eaf8 } else { 0xffffff }))
+                        .text_xs()
+                        .hover(|style| style.bg(rgb(0xe7f0f9)).cursor_pointer())
+                        .on_click(cx.listener(move |editor, _, _, cx| {
+                            editor.table_rows = rows;
+                            editor.table_cols = cols;
+                            cx.notify();
+                        }))
+                        .child(format!("{rows}x{cols}")),
+                );
+            }
+            grid = grid.child(row);
+        }
+        Self::dialog_card(
+            "\u{63d2}\u{5165}\u{8868}\u{683c}",
+            div().flex().flex_col().gap_3().child(grid).child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(Self::dialog_button(
+                        "cancel-table",
+                        "\u{53d6}\u{6d88}",
+                        false,
+                        cx.listener(|editor, _, _, cx| editor.close_dialog(cx)),
+                    ))
+                    .child(Self::dialog_button(
+                        "confirm-table",
+                        "\u{63d2}\u{5165}",
+                        true,
+                        cx.listener(|editor, _, _, cx| editor.insert_chosen_table(cx)),
+                    )),
+            ),
+        )
+        .into_any_element()
+    }
+
+    fn heading_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut buttons = div().flex().flex_wrap().gap_2();
+        for level in 0..=6 {
+            let label: SharedString = if level == 0 {
+                "\u{6b63}\u{6587}".into()
+            } else {
+                format!("H{level}").into()
+            };
+            buttons = buttons.child(
+                div()
+                    .id(("heading-level", level as usize))
+                    .px_3()
+                    .py_2()
+                    .rounded_sm()
+                    .bg(rgb(0xe7f0f9))
+                    .hover(|style| style.bg(rgb(0xd9eaf8)).cursor_pointer())
+                    .on_click(cx.listener(move |editor, _, window, cx| {
+                        editor.apply_heading_level(level, window, cx);
+                    }))
+                    .child(label),
+            );
+        }
+        Self::dialog_card(
+            "\u{6807}\u{9898}",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(buttons)
+                .child(Self::dialog_button(
+                    "cancel-heading",
+                    "\u{5173}\u{95ed}",
+                    false,
+                    cx.listener(|editor, _, _, cx| editor.close_dialog(cx)),
+                )),
+        )
+        .into_any_element()
+    }
+
+    fn publish_dialog(&self, kind: PublishKind, cx: &mut Context<Self>) -> AnyElement {
+        let markdown = self.content(cx);
+        let images = local_images(&markdown);
+        let configured = match kind {
+            PublishKind::Notion => {
+                NotionConfig::from_env().is_some()
+                    || self.publish_settings.notion_config().is_some()
+            }
+            PublishKind::Typecho => {
+                TypechoConfig::from_env().is_some()
+                    || self.publish_settings.typecho_config().is_some()
+            }
+        };
+        let existing = match kind {
+            PublishKind::Notion => self.document_meta.notion_page_id.clone(),
+            PublishKind::Typecho => self.document_meta.typecho_post_id.clone(),
+        };
+        let title = match kind {
+            PublishKind::Notion => "\u{53d1}\u{5e03}\u{5230} Notion",
+            PublishKind::Typecho => "\u{53d1}\u{5e03}\u{5230} Typecho",
+        };
+        let mut body = div().flex().flex_col().gap_3().child(settings_field(
+            "\u{6807}\u{9898}",
+            "\u{53d1}\u{5e03}\u{540e}\u{7684}\u{6587}\u{7ae0}\u{6807}\u{9898}",
+            self.publish_title_input.clone(),
+        ));
+        if existing.is_some() {
+            body = body.child(
+                div()
+                    .id("toggle-update-existing")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .hover(|style| style.bg(rgb(0xe7f0f9)).cursor_pointer())
+                    .on_click(cx.listener(|editor, _, _, cx| {
+                        editor.publish_update_existing = !editor.publish_update_existing;
+                        cx.notify();
+                    }))
+                    .child(format!(
+                        "{} \u{66f4}\u{65b0}\u{5df2}\u{6709}\u{6587}\u{7ae0} ({})",
+                        if self.publish_update_existing {
+                            "[x]"
+                        } else {
+                            "[ ]"
+                        },
+                        existing.clone().unwrap_or_default()
+                    )),
+            );
+        }
+        if kind == PublishKind::Typecho {
+            body = body.child(
+                div()
+                    .id("toggle-publish-public")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .hover(|style| style.bg(rgb(0xe7f0f9)).cursor_pointer())
+                    .on_click(cx.listener(|editor, _, _, cx| {
+                        editor.publish_public = !editor.publish_public;
+                        cx.notify();
+                    }))
+                    .child(if self.publish_public {
+                        "[x] \u{516c}\u{5f00}\u{53d1}\u{5e03}"
+                    } else {
+                        "[ ] \u{4fdd}\u{5b58}\u{4e3a}\u{8349}\u{7a3f}"
+                    }),
+            );
+        }
+        if !images.is_empty() {
+            body = body.child(div().text_xs().text_color(rgb(0xa15c12)).child(format!(
+                "\u{542b} {} \u{5904}\u{672c}\u{5730}/\u{76f8}\u{5bf9}\u{56fe}\u{7247}\u{ff0c}\u{53d1}\u{5e03}\u{540e}\u{53ef}\u{80fd}\u{65e0}\u{6cd5}\u{76f4}\u{63a5}\u{663e}\u{793a}\u{3002}",
+                images.len()
+            )));
+        }
+        if !configured {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xa15c12))
+                    .child("\u{5c1a}\u{672a}\u{914d}\u{7f6e}\u{3002}\u{53ef}\u{4ee5}\u{590d}\u{5236} Markdown\u{ff0c}\u{6216}\u{6253}\u{5f00}\u{8bbe}\u{7f6e}\u{3002}"),
+            );
+        }
+        let mut actions = div()
+            .flex()
+            .justify_end()
+            .gap_2()
+            .child(Self::dialog_button(
+                "cancel-publish",
+                "\u{53d6}\u{6d88}",
+                false,
+                cx.listener(|editor, _, _, cx| editor.close_dialog(cx)),
+            ));
+        actions = actions.child(Self::dialog_button(
+            "copy-publish",
+            "\u{590d}\u{5236} Markdown",
+            false,
+            cx.listener(|editor, _, _, cx| editor.copy_markdown_only(cx)),
+        ));
+        if !configured {
+            actions = actions.child(Self::dialog_button(
+                "open-settings-publish",
+                "\u{53d1}\u{5e03}\u{8bbe}\u{7f6e}",
+                false,
+                cx.listener(|editor, _, _, cx| {
+                    editor.dialog = EditorDialog::None;
+                    editor.settings_visible = true;
+                    cx.notify();
+                }),
+            ));
+        } else {
+            actions = actions.child(Self::dialog_button(
+                "confirm-publish",
+                if self.publishing {
+                    "\u{6b63}\u{5728}\u{53d1}\u{5e03}\u{2026}"
+                } else {
+                    "\u{53d1}\u{5e03}"
+                },
+                true,
+                cx.listener(|editor, _, window, cx| editor.confirm_publish(window, cx)),
+            ));
+        }
+        Self::dialog_card(title, body.child(actions)).into_any_element()
+    }
+
+    fn drafts_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut list = div()
+            .id("dialog-list")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .max_h(px(360.))
+            .overflow_y_scroll();
+        for (index, draft) in self.drafts.iter().enumerate() {
+            let id = draft.id.clone();
+            list = list.child(
+                div()
+                    .id(("draft-item", index))
+                    .p_2()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .hover(|style| style.bg(rgb(0xe7f0f9)).cursor_pointer())
+                    .on_click(cx.listener(move |editor, _, _, cx| {
+                        editor.load_named_draft(&id, cx);
+                    }))
+                    .child(
+                        div()
+                            .font_weight(FontWeight(600.))
+                            .child(draft.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(draft.excerpt.clone()),
+                    ),
+            );
+        }
+        Self::dialog_card(
+            "\u{8349}\u{7a3f}\u{7bb1}",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(list)
+                .child(Self::dialog_button(
+                    "close-drafts",
+                    "\u{5173}\u{95ed}",
+                    false,
+                    cx.listener(|editor, _, _, cx| editor.close_dialog(cx)),
+                )),
+        )
+        .into_any_element()
+    }
+
+    fn recent_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut list = div()
+            .id("dialog-list")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .max_h(px(360.))
+            .overflow_y_scroll();
+        if self.recent_files.is_empty() {
+            list = list.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("\u{6682}\u{65e0}\u{6700}\u{8fd1}\u{6587}\u{4ef6}"),
+            );
+        }
+        for (index, path) in self.recent_files.iter().enumerate() {
+            let path_buf = path.clone();
+            let label = display_path(path);
+            list = list.child(
+                div()
+                    .id(("recent-item", index))
+                    .p_2()
+                    .rounded_sm()
+                    .hover(|style| style.bg(rgb(0xe7f0f9)).cursor_pointer())
+                    .on_click(cx.listener(move |editor, _, _, cx| {
+                        editor.open_recent_path(path_buf.clone(), cx);
+                    }))
+                    .child(label),
+            );
+        }
+        Self::dialog_card(
+            "\u{6700}\u{8fd1}\u{6587}\u{4ef6}",
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(list)
+                .child(Self::dialog_button(
+                    "close-recent",
+                    "\u{5173}\u{95ed}",
+                    false,
+                    cx.listener(|editor, _, _, cx| editor.close_dialog(cx)),
+                )),
+        )
+        .into_any_element()
+    }
+
+    fn lightbox_dialog(&self, url: &str, alt: &str) -> AnyElement {
+        let source = preview_image_source(url, self.path.as_ref().and_then(|path| path.parent()));
+        Self::dialog_card(
+            "\u{56fe}\u{7247}",
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(img(source).max_w(px(520.)).max_h(px(420.)))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(alt.to_owned()))
+                .child(div().text_xs().text_color(rgb(BLUE)).child(url.to_owned())),
+        )
+        .into_any_element()
+    }
 }
 
 impl Render for MarkdownEditor {
@@ -1973,34 +3201,69 @@ impl Render for MarkdownEditor {
             self.last_window_title = window_title.clone();
             window.set_window_title(&window_title);
         }
-        let content = self.text_input.read(cx).content.clone();
+        self.sync_scroll_offsets();
+        let preview_content = if self.preview_source.is_empty() {
+            self.text_input.read(cx).content.clone()
+        } else {
+            self.preview_source.clone()
+        };
+        let base = self
+            .path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        let editor_scroll = self.editor_scroll.clone();
+        let preview_scroll = self.preview_scroll.clone();
         let workspace = if self.settings_visible {
             div()
-                .flex()
-                .flex_grow()
-                .min_h_0()
-                .w_full()
-                .p_3()
-                .child(settings_panel(
-                    self.notion_token_input.clone(),
-                    self.notion_parent_input.clone(),
-                    self.typecho_url_input.clone(),
-                    self.typecho_username_input.clone(),
-                    self.typecho_password_input.clone(),
-                    cx.listener(Self::close_settings),
-                    cx.listener(Self::save_publish_settings),
-                ))
-        } else if self.preview {
-            div()
-                .flex()
-                .flex_grow()
-                .min_h_0()
-                .w_full()
-                .p_3()
-                .gap_3()
-                .child(preview_panel(content.clone(), "预览 · 发布效果"))
+                    .flex()
+                    .flex_col()
+                    .flex_grow()
+                    .min_h_0()
+                    .w_full()
+                    .p_3()
+                    .gap_2()
+                    .child(settings_panel(
+                        self.notion_token_input.clone(),
+                        self.notion_parent_input.clone(),
+                        self.typecho_url_input.clone(),
+                        self.typecho_username_input.clone(),
+                        self.typecho_password_input.clone(),
+                        cx.listener(Self::close_settings),
+                        cx.listener(Self::save_publish_settings),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .px_6()
+                            .child(Self::dialog_button(
+                                "test-notion",
+                                "\u{6d4b}\u{8bd5} Notion",
+                                false,
+                                cx.listener(|editor, _, window, cx| {
+                                    editor.test_notion_settings(window, cx)
+                                }),
+                            ))
+                            .child(Self::dialog_button(
+                                "test-typecho",
+                                "\u{6d4b}\u{8bd5} Typecho",
+                                false,
+                                cx.listener(|editor, _, window, cx| {
+                                    editor.test_typecho_settings(window, cx)
+                                }),
+                            ))
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                                if NotionConfig::from_env().is_some()
+                                    || TypechoConfig::from_env().is_some()
+                                {
+                                    "\u{73af}\u{5883}\u{53d8}\u{91cf}\u{4f18}\u{5148}\u{4e8e}\u{8fd9}\u{91cc}\u{4fdd}\u{5b58}\u{7684}\u{51ed}\u{636e}\u{3002}"
+                                } else {
+                                    "\u{51ed}\u{636e}\u{4ec5}\u{4fdd}\u{5b58}\u{5230}\u{7cfb}\u{7edf}\u{5b89}\u{5168}\u{5b58}\u{50a8}\u{3002}"
+                                },
+                            )),
+                    )
         } else {
-            div()
+            let mut row = div()
                 .flex()
                 .flex_row()
                 .flex_grow()
@@ -2010,35 +3273,92 @@ impl Render for MarkdownEditor {
                 .gap_3()
                 .on_mouse_move(cx.listener(Self::splitter_mouse_move))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::splitter_mouse_up))
-                .on_mouse_up_out(MouseButton::Left, cx.listener(Self::splitter_mouse_up))
-                .child(editor_panel(
-                    self.text_input.clone(),
-                    Some(self.split_ratio),
-                ))
-                .child(
-                    div()
-                        .id("editor-preview-splitter")
-                        .w(px(6.))
-                        .h_full()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .justify_center()
-                        .cursor(CursorStyle::ResizeLeftRight)
-                        .on_mouse_down(MouseButton::Left, cx.listener(Self::splitter_mouse_down))
-                        .hover(|style| style.bg(rgb(0xd5e5f2)).cursor(CursorStyle::ResizeLeftRight))
-                        .child(div().w(px(1.)).h_full().bg(rgb(if self.splitter_dragging {
-                            BLUE
-                        } else {
-                            BORDER
-                        }))),
-                )
-                .child(preview_panel(content.clone(), "预览 · 实时 Markdown"))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(Self::splitter_mouse_up));
+            if self.outline_visible {
+                row = row.child(self.outline_panel(cx));
+            }
+            match self.workspace_mode {
+                WorkspaceMode::Edit => {
+                    row = row.child(editor_panel(self.text_input.clone(), None, editor_scroll));
+                }
+                WorkspaceMode::Preview => {
+                    row = row.child(preview_panel(
+                        preview_content,
+                        "Markdown \u{9884}\u{89c8}",
+                        preview_scroll,
+                        base,
+                    ));
+                }
+                WorkspaceMode::Split => {
+                    row = row
+                        .child(editor_panel(
+                            self.text_input.clone(),
+                            Some(self.split_ratio),
+                            editor_scroll,
+                        ))
+                        .child(
+                            div()
+                                .id("editor-preview-splitter")
+                                .w(px(6.))
+                                .h_full()
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .cursor(CursorStyle::ResizeLeftRight)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(Self::splitter_mouse_down),
+                                )
+                                .hover(|style| {
+                                    style.bg(rgb(0xd5e5f2)).cursor(CursorStyle::ResizeLeftRight)
+                                })
+                                .child(
+                                    div().w(px(1.)).h_full().bg(rgb(if self.splitter_dragging {
+                                        BLUE
+                                    } else {
+                                        BORDER
+                                    })),
+                                ),
+                        )
+                        .child(preview_panel(
+                            preview_content,
+                            "Markdown \u{9884}\u{89c8}",
+                            preview_scroll,
+                            base,
+                        ));
+                }
+            }
+            row
         };
-        let ribbon = self.ribbon(cx);
+        let ribbon = if self.focus_mode {
+            div()
+                .h(px(36.))
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .bg(rgb(RIBBON_BLUE))
+                .border_b_1()
+                .border_color(rgb(BORDER))
+                .child("\u{4e13}\u{6ce8}\u{6a21}\u{5f0f}")
+                .child(Self::dialog_button(
+                    "exit-focus",
+                    "\u{9000}\u{51fa}\u{4e13}\u{6ce8}",
+                    false,
+                    cx.listener(|editor, _, window, cx| {
+                        editor.toggle_focus(&ToggleFocus, window, cx)
+                    }),
+                ))
+                .into_any_element()
+        } else {
+            self.ribbon(cx)
+        };
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(rgb(WORKSPACE))
@@ -2048,18 +3368,29 @@ impl Render for MarkdownEditor {
             .on_action(cx.listener(Self::open_document))
             .on_action(cx.listener(Self::open_draft))
             .on_action(cx.listener(Self::save_document))
+            .on_action(cx.listener(Self::save_as_document))
             .on_action(cx.listener(Self::save_draft))
             .on_action(cx.listener(Self::toggle_preview))
+            .on_action(cx.listener(Self::cycle_workspace))
+            .on_action(cx.listener(Self::toggle_focus))
+            .on_action(cx.listener(Self::toggle_outline))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
             .on_action(cx.listener(Self::toggle_settings))
             .on_action(cx.listener(Self::bold_action))
             .on_action(cx.listener(Self::italic_action))
             .on_action(cx.listener(Self::heading_action))
+            .on_action(cx.listener(Self::heading2_action))
+            .on_action(cx.listener(Self::heading3_action))
             .on_action(cx.listener(Self::bullets_action))
             .on_action(cx.listener(Self::quote_action))
             .on_action(cx.listener(Self::link_action))
             .on_action(cx.listener(Self::strike_action))
             .on_action(cx.listener(Self::code_action))
+            .on_action(cx.listener(Self::code_block_action))
             .on_action(cx.listener(Self::image_action))
+            .on_action(cx.listener(Self::paste_image))
             .on_action(cx.listener(Self::table_action))
             .on_action(cx.listener(Self::video_action))
             .on_action(cx.listener(Self::divider_action))
@@ -2068,48 +3399,69 @@ impl Render for MarkdownEditor {
             .on_action(cx.listener(Self::quit_application))
             .on_action(cx.listener(Self::publish_to_notion))
             .on_action(cx.listener(Self::publish_to_typecho))
-            .child(
-                div()
-                    .h(RIBBON_TAB_HEIGHT)
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .bg(rgb(0xf5f6f8))
-                    .border_b_1()
-                    .border_color(rgb(BORDER))
-                    .px_2()
-                    .child(file_tab(
-                        self.active_tab == 3,
-                        cx.listener(|editor, _, _, cx| {
-                            editor.active_tab = 3;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(tab(
-                        "主页",
-                        self.active_tab == 0,
-                        cx.listener(|editor, _, _, cx| {
-                            editor.active_tab = 0;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(tab(
-                        "插入",
-                        self.active_tab == 1,
-                        cx.listener(|editor, _, _, cx| {
-                            editor.active_tab = 1;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(tab(
-                        "博客文章",
-                        self.active_tab == 2,
-                        cx.listener(|editor, _, _, cx| {
-                            editor.active_tab = 2;
-                            cx.notify();
-                        }),
-                    )),
+            .on_action(cx.listener(Self::show_drafts))
+            .on_action(cx.listener(Self::show_recent))
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(0xd9eaf8)))
+            .on_drop(cx.listener(|editor, paths: &ExternalPaths, _, cx| {
+                editor.drop_images(paths, cx);
+            }))
+            .capture_action(
+                cx.listener(|editor, _: &gpui_component::input::Paste, window, cx| {
+                    if let Some(item) = cx.read_from_clipboard()
+                        && item
+                            .entries()
+                            .iter()
+                            .any(|entry| matches!(entry, ClipboardEntry::Image(_)))
+                    {
+                        editor.paste_image(&PasteImage, window, cx);
+                        cx.stop_propagation();
+                    }
+                }),
             )
+            .when(!self.focus_mode, |this| {
+                this.child(
+                    div()
+                        .h(RIBBON_TAB_HEIGHT)
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .bg(rgb(0xf5f6f8))
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .px_2()
+                        .child(file_tab(
+                            self.active_tab == 3,
+                            cx.listener(|editor, _, _, cx| {
+                                editor.active_tab = 3;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(tab(
+                            "主页",
+                            self.active_tab == 0,
+                            cx.listener(|editor, _, _, cx| {
+                                editor.active_tab = 0;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(tab(
+                            "插入",
+                            self.active_tab == 1,
+                            cx.listener(|editor, _, _, cx| {
+                                editor.active_tab = 1;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(tab(
+                            "博客文章",
+                            self.active_tab == 2,
+                            cx.listener(|editor, _, _, cx| {
+                                editor.active_tab = 2;
+                                cx.notify();
+                            }),
+                        )),
+                )
+            })
             .child(ribbon)
             .child(workspace)
             .child(
@@ -2127,14 +3479,22 @@ impl Render for MarkdownEditor {
                     .text_color(rgb(MUTED))
                     .child(self.status.clone())
                     .child(format!(
-                        "{} · {}",
+                        "{} · {} · {}{}",
                         title,
-                        if self.preview { "预览" } else { "编辑" }
+                        self.workspace_mode.label(),
+                        self.word_status(cx),
+                        self.last_backup_at
+                            .map(|secs| format!(" · backup {secs}"))
+                            .unwrap_or_default()
                     )),
             )
+            .when(self.dialog != EditorDialog::None, |this| {
+                this.child(self.dialog_layer(cx))
+            })
     }
 }
 
+#[allow(dead_code)]
 fn line_starts(content: &str) -> Vec<usize> {
     let mut starts = vec![0];
     for (index, byte) in content.bytes().enumerate() {
@@ -2232,6 +3592,11 @@ fn encode_markdown(content: &str, encoding: FileEncoding) -> Result<Vec<u8>, Str
 }
 
 fn default_save_directory() -> PathBuf {
+    if let Some(path) = storage::load_prefs().last_directory
+        && path.is_dir()
+    {
+        return path;
+    }
     if cfg!(target_os = "windows")
         && let Some(profile) = std::env::var_os("USERPROFILE")
     {
@@ -2318,6 +3683,7 @@ fn utf16_range_to_utf8(text: &str, range: &Range<usize>) -> Range<usize> {
     utf8_offset_from_utf16(text, range.start)..utf8_offset_from_utf16(text, range.end)
 }
 
+#[allow(dead_code)]
 fn line_end(starts: &[usize], line: usize, content_len: usize) -> usize {
     starts
         .get(line + 1)
@@ -2343,6 +3709,7 @@ fn is_image_path(path: &Path) -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn markdown_image_url(path: &Path) -> String {
     let path = percent_encode_path(&path.to_string_lossy().replace('\\', "/"));
     if path.starts_with('/') {
@@ -2352,6 +3719,7 @@ fn markdown_image_url(path: &Path) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn percent_encode_path(path: &str) -> String {
     let mut encoded = String::with_capacity(path.len());
     for byte in path.bytes() {
@@ -2396,18 +3764,26 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn preview_image_source(url: &str) -> ImageSource {
+fn preview_image_source(url: &str, base: Option<&Path>) -> ImageSource {
     let decoded = percent_decode(url);
     if let Some(path) = decoded.strip_prefix("file:///") {
         ImageSource::from(PathBuf::from(path))
     } else if let Some(path) = decoded.strip_prefix("file://") {
         ImageSource::from(PathBuf::from(path))
-    } else {
+    } else if looks_like_url(&decoded) {
         ImageSource::from(decoded)
+    } else if let Some(base) = base {
+        ImageSource::from(base.join(decoded.replace('/', std::path::MAIN_SEPARATOR_STR)))
+    } else {
+        ImageSource::from(PathBuf::from(decoded))
     }
 }
 
-fn editor_panel(input: Entity<MarkdownInput>, width: Option<f32>) -> impl IntoElement {
+fn editor_panel(
+    input: Entity<MarkdownInput>,
+    width: Option<f32>,
+    scroll: ScrollHandle,
+) -> impl IntoElement {
     let mut panel = div()
         .flex()
         .flex_col()
@@ -2444,12 +3820,18 @@ fn editor_panel(input: Entity<MarkdownInput>, width: Option<f32>) -> impl IntoEl
                 .min_w_0()
                 .overflow_y_scroll()
                 .overflow_x_hidden()
+                .track_scroll(&scroll)
                 .p_5()
                 .child(input),
         )
 }
 
-fn preview_panel(content: SharedString, label: &'static str) -> impl IntoElement {
+fn preview_panel(
+    content: SharedString,
+    label: &'static str,
+    scroll: ScrollHandle,
+    base: Option<PathBuf>,
+) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -2482,9 +3864,10 @@ fn preview_panel(content: SharedString, label: &'static str) -> impl IntoElement
                 .min_w_0()
                 .overflow_y_scroll()
                 .overflow_x_hidden()
+                .track_scroll(&scroll)
                 .whitespace_normal()
                 .p_5()
-                .children(markdown_preview(content.as_ref())),
+                .children(markdown_preview(content.as_ref(), base.as_deref())),
         )
 }
 
@@ -2771,6 +4154,7 @@ fn ribbon_large_button_badged(
                 .shadow_none()
         })
         .on_click(on_click)
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
         .child(
             div()
                 .w(px(34.))
@@ -2836,6 +4220,7 @@ fn ribbon_small_button(
         })
         .active(|style| style.bg(rgb(0xc8dff2)).border_color(rgb(0x5b91c2)))
         .on_click(on_click)
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
         .child(
             div()
                 .w(px(18.))
@@ -2876,6 +4261,7 @@ fn ribbon_compact_button(
         })
         .active(|style| style.bg(rgb(0xc8dff2)).border_color(rgb(0x5b91c2)))
         .on_click(on_click)
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
         .child(ribbon_icon(icon).size_4())
 }
 
@@ -2894,7 +4280,7 @@ fn ribbon_icon(path: &'static str) -> Img {
     img(image)
 }
 
-fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
+fn markdown_preview(markdown: &str, base: Option<&Path>) -> Vec<gpui::AnyElement> {
     let blocks = parse_blocks(markdown);
     if blocks.is_empty() {
         return vec![
@@ -2925,7 +4311,7 @@ fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
                     .font_weight(FontWeight(700.))
                     .text_size(size)
                     .text_color(rgb(0x203c59))
-                    .child(inline_preview(&text))
+                    .child(inline_preview(&text, base))
                     .into_any_element()
             }
             Block::Paragraph(text) => div()
@@ -2934,29 +4320,37 @@ fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
                 .mb_3()
                 .text_base()
                 .line_height(px(26.))
-                .child(inline_preview(&text))
+                .child(inline_preview(&text, base))
                 .into_any_element(),
-            Block::Bullet(text) => div()
+            Block::Bullet { text, depth } => div()
                 .id(("preview-bullet", index))
                 .w_full()
                 .mb_1()
-                .pl_3()
+                .pl(px(12. + depth as f32 * 18.))
                 .flex()
                 .text_base()
                 .child("• ")
-                .child(inline_preview(&text))
+                .child(inline_preview(&text, base))
                 .into_any_element(),
-            Block::Numbered { marker, text } => div()
+            Block::Numbered {
+                marker,
+                text,
+                depth,
+            } => div()
                 .id(("preview-number", index))
                 .w_full()
                 .mb_1()
-                .pl_3()
+                .pl(px(12. + depth as f32 * 18.))
                 .flex()
                 .text_base()
                 .child(format!("{}. ", marker))
-                .child(inline_preview(&text))
+                .child(inline_preview(&text, base))
                 .into_any_element(),
-            Block::Task { checked, text } => {
+            Block::Task {
+                checked,
+                text,
+                depth,
+            } => {
                 let checkbox = div()
                     .w(px(18.))
                     .h(px(18.))
@@ -2975,7 +4369,7 @@ fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
                     .id(("preview-task", index))
                     .w_full()
                     .mb_1()
-                    .pl_3()
+                    .pl(px(12. + depth as f32 * 18.))
                     .flex()
                     .items_center()
                     .gap_2()
@@ -2984,7 +4378,7 @@ fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
                     .child(
                         div()
                             .when(checked, |this| this.text_color(rgb(MUTED)).line_through())
-                            .child(inline_preview(&text)),
+                            .child(inline_preview(&text, base)),
                     )
                     .into_any_element()
             }
@@ -2997,7 +4391,7 @@ fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
                 .border_color(rgb(BLUE))
                 .italic()
                 .text_color(rgb(MUTED))
-                .child(inline_preview(&text))
+                .child(inline_preview(&text, base))
                 .into_any_element(),
             Block::Aside(text) => {
                 let content = if text.trim().is_empty() {
@@ -3022,36 +4416,59 @@ fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
                             .flex_grow()
                             .min_w_0()
                             .line_height(px(24.))
-                            .child(inline_preview(&content)),
+                            .child(inline_preview(&content, base)),
                     )
                     .into_any_element()
             }
-            Block::Code { text, language } => div()
-                .id(("preview-code", index))
-                .w_full()
-                .mb_3()
-                .p_3()
-                .rounded_sm()
-                .bg(rgb(0xf1f3f5))
-                .border_1()
-                .border_color(rgb(0xdfe3e8))
-                .text_color(rgb(0x38434d))
-                .when(language.is_some(), |this| {
-                    this.child(
+            Block::Code { text, language } => {
+                let copy_text = text.clone();
+                div()
+                    .id(("preview-code", index))
+                    .w_full()
+                    .mb_3()
+                    .p_3()
+                    .rounded_sm()
+                    .bg(rgb(0xf1f3f5))
+                    .border_1()
+                    .border_color(rgb(0xdfe3e8))
+                    .text_color(rgb(0x38434d))
+                    .child(
                         div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_between()
                             .mb_1()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(language.clone().unwrap_or_default()),
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(language.clone().unwrap_or_else(|| "code".into())),
+                            )
+                            .child(
+                                div()
+                                    .id(("copy-code", index))
+                                    .text_xs()
+                                    .text_color(rgb(BLUE))
+                                    .cursor_pointer()
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy_text.clone(),
+                                        ));
+                                    })
+                                    .child("\u{590d}\u{5236}"),
+                            ),
                     )
-                })
-                .child(
-                    div()
-                        .w_full()
-                        .font_family("Menlo, Monaco, Consolas, monospace")
-                        .child(text),
-                )
-                .into_any_element(),
+                    .child(
+                        div()
+                            .id(("preview-code-scroll", index))
+                            .w_full()
+                            .overflow_x_scroll()
+                            .font_family("Menlo, Monaco, Consolas, monospace")
+                            .child(text),
+                    )
+                    .into_any_element()
+            }
             Block::Image { alt, url } => div()
                 .id(("preview-image", index))
                 .w_full()
@@ -3059,7 +4476,7 @@ fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(img(preview_image_source(&url)).max_w_full())
+                .child(img(preview_image_source(&url, base)).max_w_full())
                 .child(div().text_xs().text_color(rgb(MUTED)).child(alt))
                 .into_any_element(),
             Block::Video { url } => div()
@@ -3077,18 +4494,26 @@ fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
             Block::Table { headers, rows } => {
                 let mut table = div()
                     .id(("preview-table", index))
-                    .w_full()
-                    .mb_3()
                     .flex()
                     .flex_col()
                     .border_1()
                     .border_color(rgb(BORDER));
-                table = table.child(preview_table_row(headers, true, index * 1000));
+                table = table.child(preview_table_row(headers, true, index * 1000, base));
                 for (row_index, row) in rows.into_iter().enumerate() {
-                    table =
-                        table.child(preview_table_row(row, false, index * 1000 + row_index + 1));
+                    table = table.child(preview_table_row(
+                        row,
+                        false,
+                        index * 1000 + row_index + 1,
+                        base,
+                    ));
                 }
-                table.into_any_element()
+                div()
+                    .id(("preview-table-scroll", index))
+                    .w_full()
+                    .mb_3()
+                    .overflow_x_scroll()
+                    .child(table)
+                    .into_any_element()
             }
             Block::Divider => div()
                 .id(("preview-divider", index))
@@ -3114,7 +4539,12 @@ fn markdown_preview(markdown: &str) -> Vec<gpui::AnyElement> {
         .collect()
 }
 
-fn preview_table_row(cells: Vec<String>, header: bool, index: usize) -> gpui::AnyElement {
+fn preview_table_row(
+    cells: Vec<String>,
+    header: bool,
+    index: usize,
+    base: Option<&Path>,
+) -> gpui::AnyElement {
     let mut row = div().id(("preview-table-row", index)).flex().w_full();
     for (cell_index, cell) in cells.into_iter().enumerate() {
         let mut element = div()
@@ -3125,7 +4555,7 @@ fn preview_table_row(cells: Vec<String>, header: bool, index: usize) -> gpui::An
             .border_color(rgb(BORDER))
             .border_r_1()
             .border_b_1()
-            .child(inline_preview(&cell));
+            .child(inline_preview(&cell, base));
         if header {
             element = element.font_weight(FontWeight(600.)).bg(rgb(0xf1f6fb));
         }
@@ -3134,51 +4564,179 @@ fn preview_table_row(cells: Vec<String>, header: bool, index: usize) -> gpui::An
     row.into_any_element()
 }
 
-fn inline_preview(markdown: &str) -> gpui::AnyElement {
-    let children = parse_inline(markdown)
-        .iter()
-        .map(preview_inline_piece)
-        .collect::<Vec<_>>();
-    div()
-        .w_full()
-        .max_w_full()
-        .min_w_0()
-        .flex()
-        .flex_wrap()
-        .whitespace_normal()
-        .overflow_x_hidden()
-        .children(children)
-        .into_any_element()
+fn inline_preview(markdown: &str, base: Option<&Path>) -> gpui::AnyElement {
+    let pieces = parse_inline(markdown);
+
+    // Render styled runs as one block-level wrapped text element per segment.
+    // Wrapping them as flex items broke both behaviors: flex measures items at
+    // max-content width, so the text never saw a wrap width, while the older
+    // per-piece boxes could only wrap at style boundaries (right after closing
+    // `**`). Block segments keep natural word/CJK wrapping intact.
+    let mut column = div().w_full().max_w_full().min_w_0().flex().flex_col();
+    let mut text = String::new();
+    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+
+    for piece in pieces {
+        if let Some(url) = piece.image {
+            column = flush_inline_text(
+                column,
+                std::mem::take(&mut text),
+                std::mem::take(&mut highlights),
+            );
+            let click_url = url.clone();
+            column = column.child(
+                div()
+                    .w_full()
+                    .max_w_full()
+                    .min_w_0()
+                    .my_1()
+                    .id("preview-inline-image")
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        if looks_like_url(&click_url) {
+                            cx.open_url(&click_url);
+                        }
+                    })
+                    .child(
+                        img(preview_image_source(&url, base))
+                            .max_h(px(160.))
+                            .max_w_full(),
+                    ),
+            );
+            continue;
+        }
+        if let Some(url) = piece.link.clone() {
+            column = flush_inline_text(
+                column,
+                std::mem::take(&mut text),
+                std::mem::take(&mut highlights),
+            );
+            let click_url = url.clone();
+            let tip = url.clone();
+            column = column.child(
+                div()
+                    .id(SharedString::from(format!("preview-link-{url}")))
+                    .text_color(rgb(BLUE))
+                    .underline()
+                    .cursor_pointer()
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    .on_click(move |_, _, cx| {
+                        cx.open_url(&click_url);
+                    })
+                    .child(piece.text),
+            );
+            continue;
+        }
+
+        let start = text.len();
+        text.push_str(&piece.text);
+        let end = text.len();
+
+        let mut style = HighlightStyle::default();
+        for inline in &piece.styles {
+            style = match inline {
+                InlineStyle::Bold => HighlightStyle {
+                    font_weight: Some(FontWeight(700.)),
+                    ..style
+                },
+                InlineStyle::Italic => HighlightStyle {
+                    font_style: Some(FontStyle::Italic),
+                    ..style
+                },
+                InlineStyle::Strike => HighlightStyle {
+                    strikethrough: Some(StrikethroughStyle {
+                        thickness: px(1.),
+                        color: None,
+                    }),
+                    ..style
+                },
+                InlineStyle::Code => HighlightStyle {
+                    background_color: Some(rgb(0xf1f3f5).into()),
+                    ..style
+                },
+            };
+        }
+        if piece.link.is_some() {
+            style = HighlightStyle {
+                color: Some(rgb(BLUE).into()),
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: None,
+                    wavy: false,
+                }),
+                ..style
+            };
+        }
+        highlights.push((start..end, style));
+    }
+
+    flush_inline_text(column, text, highlights).into_any_element()
 }
 
-fn preview_inline_piece(piece: &RichTextPiece) -> gpui::AnyElement {
-    if let Some(url) = &piece.image {
-        return img(preview_image_source(url))
-            .max_h(px(160.))
+fn flush_inline_text(
+    column: gpui::Div,
+    text: String,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+) -> gpui::Div {
+    if text.is_empty() {
+        return column;
+    }
+    column.child(
+        div()
+            .w_full()
             .max_w_full()
-            .into_any_element();
-    }
-    let mut element = div()
-        .min_w_0()
-        .max_w_full()
-        .flex_shrink()
-        .whitespace_normal()
-        .child(piece.text.clone());
-    for style in &piece.styles {
-        element = match style {
-            InlineStyle::Bold => element.font_weight(FontWeight(700.)),
-            InlineStyle::Italic => element.italic(),
-            InlineStyle::Strike => element.line_through(),
-            InlineStyle::Code => element.bg(rgb(0xf1f3f5)).px_1(),
+            .min_w_0()
+            .whitespace_normal()
+            .child(StyledText::new(text).with_highlights(highlights)),
+    )
+}
+
+/// Windowed apps have no stderr, so persist panics to a log file instead of
+/// vanishing silently when the process dies.
+fn install_panic_logger() {
+    std::panic::set_hook(Box::new(|info| {
+        let message = if let Some(text) = info.payload().downcast_ref::<&str>() {
+            (*text).to_owned()
+        } else if let Some(text) = info.payload().downcast_ref::<String>() {
+            text.clone()
+        } else {
+            "unknown panic payload".to_owned()
         };
-    }
-    if piece.link.is_some() {
-        element = element.text_color(rgb(BLUE)).underline();
-    }
-    element.into_any_element()
+        let location = info
+            .location()
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+
+        let entry = format!(
+            "==== panic (unix {} s)\nmessage: {}\nlocation: {}\nbacktrace:\n{}\n",
+            timestamp,
+            message,
+            location,
+            Backtrace::force_capture(),
+        );
+        let path = crash_log_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = file.write_all(entry.as_bytes());
+        }
+    }));
 }
 
 fn main() {
+    install_panic_logger();
     let application = Application::new()
         .with_assets(Assets)
         .with_http_client(default_http_client());
@@ -3192,17 +4750,28 @@ fn main() {
             KeyBinding::new("secondary-o", OpenDocument, None),
             KeyBinding::new("secondary-shift-o", OpenDraft, None),
             KeyBinding::new("secondary-s", SaveDocument, None),
-            KeyBinding::new("secondary-shift-s", SaveDraft, None),
+            KeyBinding::new("secondary-shift-s", SaveAsDocument, None),
+            KeyBinding::new("secondary-shift-d", SaveDraft, None),
             KeyBinding::new("secondary-b", BoldText, None),
             KeyBinding::new("secondary-i", ItalicText, None),
             KeyBinding::new("secondary-1", HeadingText, None),
+            KeyBinding::new("secondary-2", Heading2Text, None),
+            KeyBinding::new("secondary-3", Heading3Text, None),
             KeyBinding::new("secondary-shift-8", BulletsText, None),
             KeyBinding::new("secondary-shift-.", QuoteText, None),
             KeyBinding::new("secondary-k", LinkText, None),
-            KeyBinding::new("secondary-shift-p", TogglePreview, None),
+            KeyBinding::new("secondary-shift-c", CodeBlockText, None),
+            KeyBinding::new("secondary-shift-p", CycleWorkspace, None),
+            KeyBinding::new("secondary-shift-f", ToggleFocus, None),
+            KeyBinding::new("f11", ToggleFocus, None),
+            KeyBinding::new("secondary-shift-l", ToggleOutline, None),
+            KeyBinding::new("secondary-equal", ZoomIn, None),
+            KeyBinding::new("secondary-minus", ZoomOut, None),
+            KeyBinding::new("secondary-0", ZoomReset, None),
             KeyBinding::new("secondary-comma", ToggleSettings, None),
             KeyBinding::new("secondary-shift-enter", PublishToNotion, None),
             KeyBinding::new("secondary-shift-t", PublishToTypecho, None),
+            KeyBinding::new("secondary-shift-r", ShowRecent, None),
             KeyBinding::new("secondary-q", QuitApplication, None),
         ]);
         // GPUI uses logical pixels. At 200% Windows scaling this opens at roughly

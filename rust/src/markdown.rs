@@ -7,14 +7,19 @@ pub enum Block {
         text: String,
     },
     Paragraph(String),
-    Bullet(String),
+    Bullet {
+        text: String,
+        depth: usize,
+    },
     Numbered {
         marker: String,
         text: String,
+        depth: usize,
     },
     Task {
         checked: bool,
         text: String,
+        depth: usize,
     },
     Quote(String),
     Aside(String),
@@ -60,7 +65,7 @@ fn append_node(node: &Node, blocks: &mut Vec<Block>) {
             text: inline_markdown(&heading.children),
         }),
         Node::Paragraph(paragraph) => append_paragraph(&paragraph.children, blocks),
-        Node::List(list) => append_list(list, blocks),
+        Node::List(list) => append_list(list, blocks, 0),
         Node::Blockquote(quote) => {
             let text = block_text(&quote.children);
             if !text.trim().is_empty() {
@@ -124,7 +129,7 @@ fn append_paragraph(children: &[Node], blocks: &mut Vec<Block>) {
     }
 }
 
-fn append_list(list: &markdown::mdast::List, blocks: &mut Vec<Block>) {
+fn append_list(list: &markdown::mdast::List, blocks: &mut Vec<Block>, depth: usize) {
     for (offset, node) in list.children.iter().enumerate() {
         let Node::ListItem(item) = node else {
             continue;
@@ -133,21 +138,26 @@ fn append_list(list: &markdown::mdast::List, blocks: &mut Vec<Block>) {
         let text = list_item_text(&item.children);
         if !text.trim().is_empty() {
             if let Some(checked) = item.checked {
-                blocks.push(Block::Task { checked, text });
+                blocks.push(Block::Task {
+                    checked,
+                    text,
+                    depth,
+                });
             } else if list.ordered {
                 let marker = list.start.unwrap_or(1) + offset as u32;
                 blocks.push(Block::Numbered {
                     marker: marker.to_string(),
                     text,
+                    depth,
                 });
             } else {
-                blocks.push(Block::Bullet(text));
+                blocks.push(Block::Bullet { text, depth });
             }
         }
 
         for child in &item.children {
-            if matches!(child, Node::List(_)) {
-                append_node(child, blocks);
+            if let Node::List(nested) = child {
+                append_list(nested, blocks, depth.saturating_add(1));
             }
         }
     }
@@ -379,10 +389,14 @@ mod tests {
                     level: 1,
                     text: "标题".into()
                 },
-                Block::Bullet("一".into()),
+                Block::Bullet {
+                    text: "一".into(),
+                    depth: 0
+                },
                 Block::Numbered {
                     marker: "1".into(),
                     text: "二".into(),
+                    depth: 0,
                 },
                 Block::Quote("三".into()),
                 Block::Code {
@@ -403,10 +417,12 @@ mod tests {
                 Block::Task {
                     checked: false,
                     text: "待完成".into(),
+                    depth: 0,
                 },
                 Block::Task {
                     checked: true,
                     text: "已完成".into(),
+                    depth: 0,
                 },
                 Block::Aside("💡 **提示**".into()),
                 Block::Aside(String::new()),
@@ -473,5 +489,26 @@ mod tests {
             "粗体 链接"
         );
         assert_eq!(strip_inline("![图片](https://example.com/a.png)"), "图片");
+    }
+
+    #[test]
+    fn preserves_nested_list_depth() {
+        assert_eq!(
+            parse_blocks("- a\n  - b\n    - c"),
+            vec![
+                Block::Bullet {
+                    text: "a".into(),
+                    depth: 0
+                },
+                Block::Bullet {
+                    text: "b".into(),
+                    depth: 1
+                },
+                Block::Bullet {
+                    text: "c".into(),
+                    depth: 2
+                },
+            ]
+        );
     }
 }

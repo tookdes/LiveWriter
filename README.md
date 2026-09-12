@@ -24,7 +24,11 @@ PowerShell users can run `./build.ps1` for a release build.
 - Markdown preview for headings, lists, quotes, code, images, video, tables,
   inline formatting, and dividers;
 - optional Notion page creation and Typecho MetaWeblog publishing;
-- OS application-data storage for drafts and publishing credentials.
+- edit / split / preview workspaces, focus mode, outline, and font zoom;
+- format toggling, multi-line lists, link/table dialogs, and ribbon tooltips;
+- image paste/drop into a per-article asset folder, draft library, recent files, and Save As;
+- publish confirmation, connection tests, and update-existing Typecho posts;
+- OS application-data storage for drafts, preferences, and publishing credentials.
 
 Publishing configuration is read from environment variables. See
 [`rust/README.md`](rust/README.md); credentials must never be committed.

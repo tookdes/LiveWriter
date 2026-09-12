@@ -452,18 +452,37 @@ fn parse_notion_page_id(status: StatusCode, body: &[u8]) -> Result<NotionPublish
     Ok(NotionPublishResult { id, url })
 }
 
+#[allow(dead_code)]
 pub async fn publish_to_typecho(
     http: Arc<dyn HttpClient>,
     config: TypechoConfig,
     title: &str,
     markdown: &str,
 ) -> Result<String> {
-    let body = metaweblog_new_post_xml(
-        &config.username,
-        &config.password,
-        title,
-        &markdown_to_html(markdown),
-    );
+    publish_or_update_typecho(http, config, title, markdown, None, true).await
+}
+
+pub async fn publish_or_update_typecho(
+    http: Arc<dyn HttpClient>,
+    config: TypechoConfig,
+    title: &str,
+    markdown: &str,
+    existing_id: Option<&str>,
+    publish: bool,
+) -> Result<String> {
+    let html = markdown_to_html(markdown);
+    let body = if let Some(post_id) = existing_id.filter(|id| !id.trim().is_empty()) {
+        metaweblog_edit_post_xml(
+            post_id,
+            &config.username,
+            &config.password,
+            title,
+            &html,
+            publish,
+        )
+    } else {
+        metaweblog_new_post_xml(&config.username, &config.password, title, &html, publish)
+    };
     let request = Request::builder()
         .method(Method::POST)
         .uri(&config.xmlrpc_url)
@@ -513,13 +532,32 @@ pub fn notion_blocks(markdown: &str) -> Result<Vec<Value>> {
 
 pub fn local_image_count(markdown: &str) -> usize {
     let file_url_count = markdown.to_ascii_lowercase().matches("file://").count();
-    let relative_image_count = parse_blocks(markdown)
-        .into_iter()
-        .filter(|block| {
-            matches!(block, Block::Image { url, .. } if !is_public_url(url.as_str()) && !is_file_url(url))
-        })
+    let extra = local_images(markdown)
+        .iter()
+        .filter(|image| !image.url.to_ascii_lowercase().contains("file://"))
         .count();
-    file_url_count + relative_image_count
+    file_url_count + extra
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalImage {
+    pub alt: String,
+    pub url: String,
+}
+
+pub fn local_images(markdown: &str) -> Vec<LocalImage> {
+    parse_blocks(markdown)
+        .into_iter()
+        .filter_map(|block| match block {
+            Block::Image { alt, url } if !is_public_url(&url) => Some(LocalImage { alt, url }),
+            _ => None,
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+pub fn replace_image_url(markdown: &str, from: &str, to: &str) -> String {
+    markdown.replace(&format!("]({from})"), &format!("]({to})"))
 }
 
 /// Typecho's MetaWeblog endpoint renders the post body as HTML, so convert the
@@ -571,7 +609,7 @@ fn block_to_notion(block: Block) -> Value {
             "type": "paragraph",
             "paragraph": { "rich_text": rich_text(&text) }
         }),
-        Block::Bullet(text) => json!({
+        Block::Bullet { text, .. } => json!({
             "object": "block",
             "type": "bulleted_list_item",
             "bulleted_list_item": { "rich_text": rich_text(&text) }
@@ -581,7 +619,7 @@ fn block_to_notion(block: Block) -> Value {
             "type": "numbered_list_item",
             "numbered_list_item": { "rich_text": rich_text(&text) }
         }),
-        Block::Task { checked, text } => json!({
+        Block::Task { checked, text, .. } => json!({
             "object": "block",
             "type": "to_do",
             "to_do": { "rich_text": rich_text(&text), "checked": checked }
@@ -675,6 +713,7 @@ fn is_public_url(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://")
 }
 
+#[allow(dead_code)]
 fn is_file_url(url: &str) -> bool {
     url.trim().to_ascii_lowercase().starts_with("file://")
 }
@@ -754,24 +793,194 @@ fn push_rich_text(result: &mut Vec<Value>, text: &str, styles: &[InlineStyle], l
     }
 }
 
-fn metaweblog_new_post_xml(username: &str, password: &str, title: &str, markdown: &str) -> String {
+fn metaweblog_post_xml(
+    method: &str,
+    first_id: &str,
+    username: &str,
+    password: &str,
+    title: &str,
+    markdown: &str,
+    publish: bool,
+) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-         <methodCall><methodName>metaWeblog.newPost</methodName><params>\
-         <param><value><string>0</string></value></param>\
+         <methodCall><methodName>{method}</methodName><params>\
+         <param><value><string>{}</string></value></param>\
          <param><value><string>{}</string></value></param>\
          <param><value><string>{}</string></value></param>\
          <param><value><struct>\
          <member><name>title</name><value><string>{}</string></value></member>\
          <member><name>description</name><value><string>{}</string></value></member>\
          </struct></value></param>\
-         <param><value><boolean>1</boolean></value></param>\
+         <param><value><boolean>{}</boolean></value></param>\
          </params></methodCall>",
+        xml_escape(first_id),
         xml_escape(username),
         xml_escape(password),
         xml_escape(title),
         xml_escape(markdown),
+        if publish { "1" } else { "0" },
     )
+}
+
+fn metaweblog_new_post_xml(
+    username: &str,
+    password: &str,
+    title: &str,
+    markdown: &str,
+    publish: bool,
+) -> String {
+    metaweblog_post_xml(
+        "metaWeblog.newPost",
+        "0",
+        username,
+        password,
+        title,
+        markdown,
+        publish,
+    )
+}
+
+fn metaweblog_edit_post_xml(
+    post_id: &str,
+    username: &str,
+    password: &str,
+    title: &str,
+    markdown: &str,
+    publish: bool,
+) -> String {
+    metaweblog_post_xml(
+        "metaWeblog.editPost",
+        post_id,
+        username,
+        password,
+        title,
+        markdown,
+        publish,
+    )
+}
+
+pub fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let remaining = bytes.len() - index;
+        let b0 = bytes[index];
+        let b1 = if remaining > 1 { bytes[index + 1] } else { 0 };
+        let b2 = if remaining > 2 { bytes[index + 2] } else { 0 };
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if remaining > 1 {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if remaining > 2 {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        index += 3;
+    }
+    out
+}
+
+#[allow(dead_code)]
+pub async fn upload_typecho_media(
+    http: Arc<dyn HttpClient>,
+    config: TypechoConfig,
+    file_name: &str,
+    mime: &str,
+    bytes: &[u8],
+) -> Result<String> {
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><methodCall><methodName>metaWeblog.newMediaObject</methodName><params><param><value><string>0</string></value></param><param><value><string>{}</string></value></param><param><value><string>{}</string></value></param><param><value><struct><member><name>name</name><value><string>{}</string></value></member><member><name>type</name><value><string>{}</string></value></member><member><name>bits</name><value><base64>{}</base64></value></member></struct></value></param></params></methodCall>",
+        xml_escape(&config.username),
+        xml_escape(&config.password),
+        xml_escape(file_name),
+        xml_escape(mime),
+        encode_base64(bytes),
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(&config.xmlrpc_url)
+        .header("Content-Type", "text/xml; charset=utf-8")
+        .body(AsyncBody::from(body.into_bytes()))?;
+    let (status, body) = request_with_timeout(async {
+        let mut response = http.send(request).await?;
+        let status = response.status();
+        let body = read_body(&mut response).await?;
+        Ok::<_, anyhow::Error>((status, body))
+    })
+    .await?;
+    let text = String::from_utf8_lossy(&body);
+    if !status.is_success() {
+        bail!("Typecho media HTTP {}: {}", status.as_u16(), text.trim());
+    }
+    if text.contains("<fault>") {
+        bail!("Typecho media XML-RPC error: {}", text.trim());
+    }
+    extract_xml_tag(&text, "string")
+        .or_else(|| extract_xml_tag(&text, "url"))
+        .ok_or_else(|| anyhow::anyhow!("Typecho media upload returned no URL"))
+}
+
+pub async fn test_notion_connection(
+    http: Arc<dyn HttpClient>,
+    config: NotionConfig,
+) -> Result<String> {
+    let request = notion_request(
+        &config.token,
+        Method::GET,
+        "https://api.notion.com/v1/users/me".to_owned(),
+        None,
+    )?;
+    let (status, body) = send_notion_request(http, request).await?;
+    if !status.is_success() {
+        bail!(
+            "Notion test HTTP {}: {}",
+            status.as_u16(),
+            response_text(&body)
+        );
+    }
+    let value: Value = serde_json::from_slice(&body)?;
+    let name = value["name"]
+        .as_str()
+        .or_else(|| value["bot"]["owner"]["user"]["name"].as_str())
+        .unwrap_or("Notion");
+    Ok(name.to_owned())
+}
+
+pub async fn test_typecho_connection(
+    http: Arc<dyn HttpClient>,
+    config: TypechoConfig,
+) -> Result<String> {
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><methodCall><methodName>blogger.getUsersBlogs</methodName><params><param><value><string>0</string></value></param><param><value><string>{}</string></value></param><param><value><string>{}</string></value></param></params></methodCall>",
+        xml_escape(&config.username),
+        xml_escape(&config.password),
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(&config.xmlrpc_url)
+        .header("Content-Type", "text/xml; charset=utf-8")
+        .body(AsyncBody::from(body.into_bytes()))?;
+    let (status, body) = request_with_timeout(async {
+        let mut response = http.send(request).await?;
+        let status = response.status();
+        let body = read_body(&mut response).await?;
+        Ok::<_, anyhow::Error>((status, body))
+    })
+    .await?;
+    let text = String::from_utf8_lossy(&body);
+    if !status.is_success() {
+        bail!("Typecho test HTTP {}: {}", status.as_u16(), text.trim());
+    }
+    if text.contains("<fault>") {
+        bail!("Typecho test XML-RPC error: {}", text.trim());
+    }
+    Ok(extract_xml_tag(&text, "string").unwrap_or_else(|| "Typecho".to_owned()))
 }
 
 async fn read_body(response: &mut gpui::http_client::Response<AsyncBody>) -> Result<Vec<u8>> {
@@ -793,15 +1002,18 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn extract_xml_tag(response: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = response.find(&open)? + open.len();
+    let end = response[start..].find(&close)?;
+    Some(response[start..start + end].to_owned())
+}
+
 fn extract_xml_value(response: &str) -> Option<String> {
     for tag in ["string", "int", "i4"] {
-        let open = format!("<{tag}>");
-        let close = format!("</{tag}>");
-        if let Some(start) = response.find(&open) {
-            let start = start + open.len();
-            if let Some(end) = response[start..].find(&close) {
-                return Some(response[start..start + end].to_owned());
-            }
+        if let Some(value) = extract_xml_tag(response, tag) {
+            return Some(value);
         }
     }
     None
@@ -966,8 +1178,14 @@ mod tests {
         assert_eq!(document_title("# 我的文章\n\n正文"), "我的文章");
         assert_eq!(document_title("开头说明\n\n# 正式标题"), "正式标题");
         assert_eq!(xml_escape("<a&\"'"), "&lt;a&amp;&quot;&apos;");
-        let xml = metaweblog_new_post_xml("u&", "p", "标题", "正文");
+        let xml = metaweblog_new_post_xml("u&", "p", "标题", "正文", true);
         assert!(xml.contains("<string>u&amp;</string>"));
         assert!(xml.contains("<member><name>description</name>"));
+    }
+
+    #[test]
+    fn encodes_base64_and_lists_local_images() {
+        assert_eq!(super::encode_base64(b"Man"), "TWFu");
+        assert_eq!(super::local_images("![a](file:///C:/x.png)").len(), 1);
     }
 }
