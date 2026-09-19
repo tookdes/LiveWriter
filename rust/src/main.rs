@@ -35,7 +35,8 @@ use gpui_component::{
 use rust_embed::Embed;
 
 use crate::editing::{
-    character_count, document_outline, is_clipboard_url, looks_like_url, markdown_code_block,
+    ActiveBlock, InlineFormatState, active_block, character_count, document_outline,
+    inline_format_state, is_clipboard_url, linkify_selection, looks_like_url, markdown_code_block,
     markdown_link, markdown_table, normalize_url, selection_has_wrap, set_heading_level,
     toggle_prefixes, wrap_or_unwrap,
 };
@@ -280,6 +281,39 @@ impl MarkdownInput {
         })
     }
 
+    fn context_state(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (ActiveBlock, InlineFormatState) {
+        let range = self.current_range(window, cx);
+        let full = self.state.read(cx).text().to_string();
+        let cursor = range.end.min(full.len());
+        let starts = crate::editing::line_starts(&full);
+        let line = crate::editing::line_index(&starts, cursor);
+        let start = starts[line];
+        let end = crate::editing::line_end(&starts, line, full.len());
+        (
+            active_block(&full[start..end]),
+            inline_format_state(&full, range),
+        )
+    }
+
+    fn linkify_selected_text(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let range = self.current_range(window, cx);
+        let full = self.state.read(cx).text().to_string();
+        let Some((next, cursor)) = linkify_selection(&full, range, url) else {
+            return false;
+        };
+        self.apply_document_edit(next, cursor, window, cx);
+        true
+    }
+
     fn apply_document_edit(
         &mut self,
         next: String,
@@ -392,14 +426,14 @@ fn subscribe_input_state(
     cx.subscribe(
         state,
         |input: &mut MarkdownInput, state, event: &InputEvent, cx| {
-            if !matches!(event, InputEvent::Change) {
-                return;
+            if matches!(event, InputEvent::Change) {
+                let next = state.read(cx).value();
+                if next != input.content {
+                    input.content = next;
+                }
             }
-            let next = state.read(cx).value();
-            if next == input.content {
-                return;
-            }
-            input.content = next;
+            // Selection/caret changes matter to the native Ribbon even when the
+            // Markdown text itself did not change.
             cx.notify();
         },
     )
@@ -552,8 +586,10 @@ impl MarkdownEditor {
                 editor.dirty = true;
                 editor.status = "正在编辑 · 尚未保存".into();
                 editor.schedule_preview(cx);
-                cx.notify();
             }
+            // The child also notifies for caret/selection changes so formatting
+            // state in the Ribbon stays in sync with the native editor.
+            cx.notify();
         });
         let editor = Self {
             text_input,
@@ -2072,7 +2108,10 @@ impl MarkdownEditor {
         .into_any_element()
     }
 
-    fn ribbon(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn ribbon(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let (active_block, inline_state) = self
+            .text_input
+            .update(cx, |input, cx| input.context_state(window, cx));
         match self.active_tab {
             0 => div()
                 .h(RIBBON_HEIGHT)
@@ -2132,9 +2171,10 @@ impl MarkdownEditor {
                                 .flex()
                                 .items_center()
                                 .gap_1()
-                                .child(ribbon_compact_button(
+                                .child(ribbon_compact_toggle(
                                     "icons/bold.png",
                                     "粗体",
+                                    inline_state.bold,
                                     cx.listener(|editor, event, window, cx| {
                                         editor.format_button(
                                             "**",
@@ -2146,9 +2186,10 @@ impl MarkdownEditor {
                                         )
                                     }),
                                 ))
-                                .child(ribbon_compact_button(
+                                .child(ribbon_compact_toggle(
                                     "icons/italic.png",
                                     "斜体",
+                                    inline_state.italic,
                                     cx.listener(|editor, event, window, cx| {
                                         editor.format_button(
                                             "*",
@@ -2160,16 +2201,18 @@ impl MarkdownEditor {
                                         )
                                     }),
                                 ))
-                                .child(ribbon_compact_button(
+                                .child(ribbon_compact_toggle(
                                     "icons/strike.png",
                                     "删除线",
+                                    inline_state.strike,
                                     cx.listener(|editor, _event, window, cx| {
                                         editor.strike_action(&StrikeText, window, cx)
                                     }),
                                 ))
-                                .child(ribbon_compact_button(
+                                .child(ribbon_compact_toggle(
                                     "icons/code.png",
                                     "行内代码",
+                                    inline_state.code,
                                     cx.listener(|editor, _event, window, cx| {
                                         editor.code_action(&CodeText, window, cx)
                                     }),
@@ -2189,24 +2232,27 @@ impl MarkdownEditor {
                 .child(ribbon_group(
                     "段落",
                     ribbon_controls!(
-                        ribbon_large_button(
+                        ribbon_large_toggle(
                             "icons/paragraph-large.png",
                             "列表",
+                            matches!(active_block, ActiveBlock::Bullet | ActiveBlock::Numbered),
                             cx.listener(|editor, event, window, cx| {
                                 editor.prefix_button("- ", "已切换无序列表", event, window, cx)
                             }),
                         ),
                         ribbon_stack!(
-                            ribbon_small_button(
+                            ribbon_small_toggle(
                                 "icons/heading.png",
                                 "标题",
+                                matches!(active_block, ActiveBlock::Heading(_)),
                                 cx.listener(|editor, _event, _window, cx| {
                                     editor.heading_menu(cx)
                                 }),
                             ),
-                            ribbon_small_button(
+                            ribbon_small_toggle(
                                 "icons/bullets.png",
                                 "待办清单",
+                                matches!(active_block, ActiveBlock::Task),
                                 cx.listener(|editor, event, window, cx| {
                                     editor.prefix_button(
                                         "- [ ] ",
@@ -2217,9 +2263,10 @@ impl MarkdownEditor {
                                     )
                                 }),
                             ),
-                            ribbon_small_button(
+                            ribbon_small_toggle(
                                 "icons/blockquote.png",
                                 "引用",
+                                matches!(active_block, ActiveBlock::Quote),
                                 cx.listener(|editor, event, window, cx| {
                                     editor.prefix_button("> ", "已切换引用", event, window, cx)
                                 }),
@@ -3353,7 +3400,7 @@ impl Render for MarkdownEditor {
                 ))
                 .into_any_element()
         } else {
-            self.ribbon(cx)
+            self.ribbon(window, cx)
         };
 
         div()
@@ -3407,14 +3454,27 @@ impl Render for MarkdownEditor {
             }))
             .capture_action(
                 cx.listener(|editor, _: &gpui_component::input::Paste, window, cx| {
-                    if let Some(item) = cx.read_from_clipboard()
-                        && item
-                            .entries()
-                            .iter()
-                            .any(|entry| matches!(entry, ClipboardEntry::Image(_)))
+                    let Some(item) = cx.read_from_clipboard() else {
+                        return;
+                    };
+                    if item
+                        .entries()
+                        .iter()
+                        .any(|entry| matches!(entry, ClipboardEntry::Image(_)))
                     {
                         editor.paste_image(&PasteImage, window, cx);
                         cx.stop_propagation();
+                        return;
+                    }
+                    if let Some(text) = item.text()
+                        && is_clipboard_url(&text)
+                        && editor.text_input.update(cx, |input, cx| {
+                            input.linkify_selected_text(&text, window, cx)
+                        })
+                    {
+                        editor.status = "已将所选文字转换为超链接".into();
+                        cx.stop_propagation();
+                        cx.notify();
                     }
                 }),
             )
@@ -4263,6 +4323,127 @@ fn ribbon_compact_button(
         .on_click(on_click)
         .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
         .child(ribbon_icon(icon).size_4())
+}
+
+
+fn ribbon_compact_toggle(
+    icon: &'static str,
+    label: &'static str,
+    selected: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id((label, "toggle"))
+        .w(px(28.))
+        .h(px(23.))
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(if selected { rgb(0x5b91c2) } else { hsla(0., 0., 0., 0.) })
+        .when(selected, |style| style.bg(rgb(0xc8dff2)))
+        .hover(|style| {
+            style
+                .bg(linear_gradient(
+                    0.,
+                    linear_color_stop(rgb(0xffffff), 0.),
+                    linear_color_stop(rgb(0xdcecf9), 1.),
+                ))
+                .border_color(rgb(0x8db6d9))
+                .cursor_pointer()
+        })
+        .active(|style| style.bg(rgb(0xc8dff2)).border_color(rgb(0x5b91c2)))
+        .on_click(on_click)
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+        .child(ribbon_icon(icon).size_4())
+}
+
+fn ribbon_small_toggle(
+    icon: &'static str,
+    label: &'static str,
+    selected: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id((label, "toggle"))
+        .min_w(px(84.))
+        .h(RIBBON_SMALL_BUTTON_HEIGHT)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .px_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(if selected { rgb(0x5b91c2) } else { hsla(0., 0., 0., 0.) })
+        .when(selected, |style| style.bg(rgb(0xc8dff2)))
+        .text_size(px(12.))
+        .text_color(rgb(TEXT))
+        .hover(|style| {
+            style
+                .bg(linear_gradient(
+                    0.,
+                    linear_color_stop(rgb(0xffffff), 0.),
+                    linear_color_stop(rgb(0xdcecf9), 1.),
+                ))
+                .border_color(rgb(0x8db6d9))
+                .cursor_pointer()
+        })
+        .active(|style| style.bg(rgb(0xc8dff2)).border_color(rgb(0x5b91c2)))
+        .on_click(on_click)
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+        .child(
+            div()
+                .w(px(18.))
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(ribbon_icon(icon).size_4()),
+        )
+        .child(label)
+}
+
+fn ribbon_large_toggle(
+    icon: &'static str,
+    label: &'static str,
+    selected: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id((label, "toggle"))
+        .w(RIBBON_LARGE_BUTTON_WIDTH)
+        .h(RIBBON_LARGE_BUTTON_HEIGHT)
+        .flex()
+        .flex_col()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .px_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(if selected { rgb(0x5b91c2) } else { hsla(0., 0., 0., 0.) })
+        .when(selected, |style| style.bg(rgb(0xc8dff2)))
+        .text_xs()
+        .text_color(rgb(TEXT))
+        .hover(|style| {
+            style
+                .bg(linear_gradient(
+                    0.,
+                    linear_color_stop(rgb(0xffffff), 0.),
+                    linear_color_stop(rgb(0xd9eaf8), 1.),
+                ))
+                .border_color(rgb(0x8db6d9))
+                .cursor_pointer()
+        })
+        .active(|style| style.bg(rgb(0xc8dff2)).border_color(rgb(0x5b91c2)))
+        .on_click(on_click)
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+        .child(ribbon_icon(icon).w(px(32.)).h(px(32.)))
+        .child(label)
 }
 
 fn ribbon_icon(path: &'static str) -> Img {
