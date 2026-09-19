@@ -3466,7 +3466,13 @@ impl Render for MarkdownEditor {
                         cx.stop_propagation();
                         return;
                     }
-                    if let Some(text) = item.text()
+                    let editor_focused = editor
+                        .text_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window);
+                    if editor_focused
+                        && let Some(text) = item.text()
                         && is_clipboard_url(&text)
                         && editor.text_input.update(cx, |input, cx| {
                             input.linkify_selected_text(&text, window, cx)
