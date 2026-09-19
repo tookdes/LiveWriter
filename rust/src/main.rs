@@ -287,11 +287,11 @@ impl MarkdownInput {
         })
     }
 
-    fn context_state(
+    fn visual_context(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> (ActiveBlock, InlineFormatState) {
+    ) -> EditorVisualContext {
         let range = self.current_range(window, cx);
         let full = self.state.read(cx).text().to_string();
         let cursor = range.end.min(full.len());
@@ -299,10 +299,19 @@ impl MarkdownInput {
         let line = crate::editing::line_index(&starts, cursor);
         let start = starts[line];
         let end = crate::editing::line_end(&starts, line, full.len());
-        (
-            active_block(&full[start..end]),
+        EditorVisualContext::from_line(
+            &full[start..end],
             inline_format_state(&full, range),
         )
+    }
+
+    fn context_state(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (ActiveBlock, InlineFormatState) {
+        let context = self.visual_context(window, cx);
+        (context.block, context.inline)
     }
 
     fn linkify_selected_text(
@@ -508,6 +517,88 @@ enum EditorDialog {
 enum PublishKind {
     Notion,
     Typecho,
+}
+
+#[derive(Clone, Debug)]
+struct EditorVisualContext {
+    block: ActiveBlock,
+    marker: SharedString,
+    body: SharedString,
+    inline: InlineFormatState,
+    checked: bool,
+}
+
+impl EditorVisualContext {
+    fn from_line(line: &str, inline: InlineFormatState) -> Self {
+        let trimmed = line.trim_start();
+        let block = active_block(trimmed);
+        let mut marker = String::new();
+        let mut body = trimmed.to_owned();
+        let mut checked = false;
+
+        match block {
+            ActiveBlock::Heading(level) => {
+                marker = "#".repeat(level as usize);
+                body = trimmed[level as usize..].trim_start().to_owned();
+            }
+            ActiveBlock::Bullet => {
+                let prefix = trimmed.get(..2).unwrap_or("");
+                marker = prefix.trim_end().to_owned();
+                body = trimmed.get(2..).unwrap_or("").to_owned();
+            }
+            ActiveBlock::Task => {
+                checked = trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ");
+                marker = if checked { "☑" } else { "☐" }.to_owned();
+                body = trimmed.get(6..).unwrap_or("").to_owned();
+            }
+            ActiveBlock::Quote => {
+                marker = "❯".to_owned();
+                body = trimmed.strip_prefix("> ").unwrap_or(trimmed).to_owned();
+            }
+            ActiveBlock::Numbered => {
+                let bytes = trimmed.as_bytes();
+                let mut digits = 0usize;
+                while digits < bytes.len() && bytes[digits].is_ascii_digit() {
+                    digits += 1;
+                }
+                let marker_len = if digits < bytes.len() { digits + 1 } else { digits };
+                marker = trimmed[..marker_len.min(trimmed.len())].to_owned();
+                body = trimmed
+                    .get((digits + 2).min(trimmed.len())..)
+                    .unwrap_or("")
+                    .to_owned();
+            }
+            ActiveBlock::Paragraph => {}
+        }
+
+        Self {
+            block,
+            marker: marker.into(),
+            body: body.into(),
+            inline,
+            checked,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self.block {
+            ActiveBlock::Heading(1) => "H1 标题",
+            ActiveBlock::Heading(2) => "H2 标题",
+            ActiveBlock::Heading(3) => "H3 标题",
+            ActiveBlock::Heading(_) => "标题",
+            ActiveBlock::Bullet => "无序列表",
+            ActiveBlock::Task => "待办",
+            ActiveBlock::Quote => "引用",
+            ActiveBlock::Numbered => "有序列表",
+            ActiveBlock::Paragraph => {
+                if self.inline.code {
+                    "行内代码"
+                } else {
+                    "普通段落"
+                }
+            }
+        }
+    }
 }
 
 struct MarkdownEditor {
@@ -3301,6 +3392,9 @@ impl Render for MarkdownEditor {
             .and_then(|path| path.parent().map(Path::to_path_buf));
         let editor_scroll = self.editor_scroll.clone();
         let preview_scroll = self.preview_scroll.clone();
+        let editor_context = self
+            .text_input
+            .update(cx, |input, cx| input.visual_context(window, cx));
         let workspace = if self.settings_visible {
             div()
                     .flex()
@@ -3367,7 +3461,12 @@ impl Render for MarkdownEditor {
             }
             match self.workspace_mode {
                 WorkspaceMode::Edit => {
-                    row = row.child(editor_panel(self.text_input.clone(), None, editor_scroll));
+                    row = row.child(editor_panel(
+                        self.text_input.clone(),
+                        None,
+                        editor_scroll,
+                        editor_context.clone(),
+                    ));
                 }
                 WorkspaceMode::Preview => {
                     row = row.child(preview_panel(
@@ -3383,6 +3482,7 @@ impl Render for MarkdownEditor {
                             self.text_input.clone(),
                             Some(self.split_ratio),
                             editor_scroll,
+                            editor_context.clone(),
                         ))
                         .child(
                             div()
@@ -3949,7 +4049,9 @@ fn editor_panel(
     input: Entity<MarkdownInput>,
     width: Option<f32>,
     scroll: ScrollHandle,
+    context: EditorVisualContext,
 ) -> impl IntoElement {
+    let show_lens = !context.body.as_ref().trim().is_empty();
     let mut panel = div()
         .flex()
         .flex_col()
@@ -3969,14 +4071,28 @@ fn editor_panel(
                 .h(px(32.))
                 .flex()
                 .items_center()
+                .justify_between()
                 .px_3()
                 .bg(rgb(0xf4f7fa))
                 .border_b_1()
                 .border_color(rgb(BORDER))
                 .text_sm()
                 .text_color(rgb(MUTED))
-                .child("编辑 · Markdown 源文"),
+                .child("编辑 · Markdown 源文")
+                .child(
+                    div()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_sm()
+                        .bg(rgb(0xe7f0f9))
+                        .text_xs()
+                        .text_color(rgb(DARK_BLUE))
+                        .child(context.label()),
+                ),
         )
+        .when(show_lens, |this| {
+            this.child(editor_prose_lens(context.clone()))
+        })
         .child(
             div()
                 .id("markdown-editor-scroll")
@@ -3990,6 +4106,143 @@ fn editor_panel(
                 .p_5()
                 .child(input),
         )
+}
+
+fn editor_inline_badges(state: InlineFormatState) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .when(state.bold, |this| {
+            this.child(
+                div()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(rgb(0xe7f0f9))
+                    .font_weight(FontWeight(700.))
+                    .child("B"),
+            )
+        })
+        .when(state.italic, |this| {
+            this.child(
+                div()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(rgb(0xe7f0f9))
+                    .child("I"),
+            )
+        })
+        .when(state.strike, |this| {
+            this.child(
+                div()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(rgb(0xe7f0f9))
+                    .child("S"),
+            )
+        })
+        .when(state.code, |this| {
+            this.child(
+                div()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(rgb(0xe7f0f9))
+                    .child("</>"),
+            )
+        })
+}
+
+fn editor_prose_lens(context: EditorVisualContext) -> AnyElement {
+    let body = context.body.clone();
+    let inline = context.inline;
+    let content = match context.block {
+        ActiveBlock::Heading(level) => {
+            let size = match level {
+                1 => px(20.),
+                2 => px(18.),
+                3 => px(17.),
+                _ => px(16.),
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(size)
+                .font_weight(FontWeight(700.))
+                .text_color(rgb(0x203c59))
+                .child(body)
+                .into_any_element()
+        }
+        ActiveBlock::Quote => div()
+            .flex()
+            .items_center()
+            .border_l_3()
+            .border_color(rgb(BLUE))
+            .pl_3()
+            .text_color(rgb(0x50677d))
+            .child(body)
+            .into_any_element(),
+        ActiveBlock::Bullet | ActiveBlock::Numbered => div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .font_weight(FontWeight(700.))
+                    .text_color(rgb(BLUE))
+                    .child(context.marker.clone()),
+            )
+            .child(body)
+            .into_any_element(),
+        ActiveBlock::Task => div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .font_weight(FontWeight(700.))
+                    .text_color(rgb(if context.checked { 0x64815f } else { BLUE }))
+                    .child(context.marker.clone()),
+            )
+            .child(
+                div()
+                    .when(context.checked, |this| {
+                        this.text_color(rgb(MUTED)).line_through()
+                    })
+                    .child(body),
+            )
+            .into_any_element(),
+        ActiveBlock::Paragraph => div().flex().items_center().child(body).into_any_element(),
+    };
+
+    div()
+        .min_h(px(42.))
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .px_4()
+        .py_2()
+        .bg(rgb(0xfafcfe))
+        .border_b_1()
+        .border_color(rgb(0xe4eaf0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x8796a5))
+                        .child("排版"),
+                )
+                .child(content),
+        )
+        .child(editor_inline_badges(inline))
+        .into_any_element()
 }
 
 fn preview_panel(
