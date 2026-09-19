@@ -19,4 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [build-dependencies]
+# Keep the C compiler helper in the range required by gpui-component's bundled
+# tree-sitter grammars while remaining compatible with embed-resource.
+cc = "~1.2.1"
 embed-resource = "3.0"
