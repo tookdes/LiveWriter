@@ -4325,7 +4325,6 @@ fn ribbon_compact_button(
         .child(ribbon_icon(icon).size_4())
 }
 
-
 fn ribbon_compact_toggle(
     icon: &'static str,
     label: &'static str,
@@ -4342,7 +4341,11 @@ fn ribbon_compact_toggle(
         .justify_center()
         .rounded_sm()
         .border_1()
-        .border_color(if selected { rgb(0x5b91c2) } else { hsla(0., 0., 0., 0.) })
+        .border_color(if selected {
+            rgb(0x5b91c2)
+        } else {
+            hsla(0., 0., 0., 0.)
+        })
         .when(selected, |style| style.bg(rgb(0xc8dff2)))
         .hover(|style| {
             style
@@ -4377,7 +4380,11 @@ fn ribbon_small_toggle(
         .px_1()
         .rounded_sm()
         .border_1()
-        .border_color(if selected { rgb(0x5b91c2) } else { hsla(0., 0., 0., 0.) })
+        .border_color(if selected {
+            rgb(0x5b91c2)
+        } else {
+            hsla(0., 0., 0., 0.)
+        })
         .when(selected, |style| style.bg(rgb(0xc8dff2)))
         .text_size(px(12.))
         .text_color(rgb(TEXT))
@@ -4425,7 +4432,11 @@ fn ribbon_large_toggle(
         .px_1()
         .rounded_sm()
         .border_1()
-        .border_color(if selected { rgb(0x5b91c2) } else { hsla(0., 0., 0., 0.) })
+        .border_color(if selected {
+            rgb(0x5b91c2)
+        } else {
+            hsla(0., 0., 0., 0.)
+        })
         .when(selected, |style| style.bg(rgb(0xc8dff2)))
         .text_xs()
         .text_color(rgb(TEXT))
