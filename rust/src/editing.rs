@@ -589,7 +589,6 @@ pub fn linkify_selection(text: &str, range: Range<usize>, url: &str) -> Option<(
     Some((next, cursor))
 }
 
-
 const MARKDOWN_NEST_INDENT: &str = "  ";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -632,7 +631,10 @@ fn markdown_continuation(line: &str) -> Option<(usize, usize, MarkdownContinuati
     }
 
     let bytes = rest.as_bytes();
-    let digits = bytes.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    let digits = bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
     if digits > 0 {
         let delimiter = match bytes.get(digits) {
             Some(b'.') => '.',
@@ -809,7 +811,10 @@ pub fn adjust_markdown_list_indent(
     let replace_start = starts[start_line];
     let replace_end = line_end(&starts, end_line, text.len());
     let mut next = String::with_capacity(
-        text.len() + replacement.len().saturating_sub(replace_end - replace_start),
+        text.len()
+            + replacement
+                .len()
+                .saturating_sub(replace_end - replace_start),
     );
     next.push_str(&text[..replace_start]);
     next.push_str(&replacement);
@@ -901,28 +906,23 @@ mod tests {
 
     #[test]
     fn smart_enter_continues_markdown_blocks_and_exits_empty_items() {
-        let (next, cursor) =
-            smart_markdown_enter("- one", 5..5).expect("bullet continuation");
+        let (next, cursor) = smart_markdown_enter("- one", 5..5).expect("bullet continuation");
         assert_eq!(next, "- one\n- ");
         assert_eq!(cursor, next.len());
 
-        let (next, cursor) =
-            smart_markdown_enter("- [x] done", 10..10).expect("task continuation");
+        let (next, cursor) = smart_markdown_enter("- [x] done", 10..10).expect("task continuation");
         assert_eq!(next, "- [x] done\n- [ ] ");
         assert_eq!(cursor, next.len());
 
-        let (next, cursor) =
-            smart_markdown_enter("9. nine", 7..7).expect("number continuation");
+        let (next, cursor) = smart_markdown_enter("9. nine", 7..7).expect("number continuation");
         assert_eq!(next, "9. nine\n10. ");
         assert_eq!(cursor, next.len());
 
-        let (next, cursor) =
-            smart_markdown_enter("> quote", 7..7).expect("quote continuation");
+        let (next, cursor) = smart_markdown_enter("> quote", 7..7).expect("quote continuation");
         assert_eq!(next, "> quote\n> ");
         assert_eq!(cursor, next.len());
 
-        let (next, cursor) =
-            smart_markdown_enter("- one\n- ", 8..8).expect("empty item exits");
+        let (next, cursor) = smart_markdown_enter("- one\n- ", 8..8).expect("empty item exits");
         assert_eq!(next, "- one\n");
         assert_eq!(cursor, 6);
 
@@ -965,13 +965,11 @@ mod tests {
 
     #[test]
     fn toggles_task_checkbox_without_moving_the_caret() {
-        let (checked, cursor) =
-            toggle_markdown_task("  - [ ] task", 10).expect("check task");
+        let (checked, cursor) = toggle_markdown_task("  - [ ] task", 10).expect("check task");
         assert_eq!(checked, "  - [x] task");
         assert_eq!(cursor, 10);
 
-        let (unchecked, cursor) =
-            toggle_markdown_task(&checked, cursor).expect("uncheck task");
+        let (unchecked, cursor) = toggle_markdown_task(&checked, cursor).expect("uncheck task");
         assert_eq!(unchecked, "  - [ ] task");
         assert_eq!(cursor, 10);
         assert!(toggle_markdown_task("- bullet", 4).is_none());
