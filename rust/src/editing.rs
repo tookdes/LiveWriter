@@ -690,6 +690,23 @@ pub fn smart_markdown_enter(text: &str, range: Range<usize>) -> Option<(String, 
 
     let body = &line_text[indent_len + marker_len..];
     if body.trim().is_empty() {
+        if indent_len > 0 {
+            let remove = if line_text.starts_with(MARKDOWN_NEST_INDENT) {
+                MARKDOWN_NEST_INDENT.len()
+            } else if line_text.starts_with('\t') || line_text.starts_with(' ') {
+                1
+            } else {
+                0
+            };
+            if remove > 0 {
+                let mut next = String::with_capacity(text.len().saturating_sub(remove));
+                next.push_str(&text[..line_start]);
+                next.push_str(&line_text[remove..]);
+                next.push_str(&text[line_stop..]);
+                return Some((next, start.saturating_sub(remove)));
+            }
+        }
+
         let mut next = String::with_capacity(text.len().saturating_sub(line_text.len()));
         next.push_str(&text[..line_start]);
         next.push_str(&text[line_stop..]);
@@ -908,6 +925,16 @@ mod tests {
             smart_markdown_enter("- one\n- ", 8..8).expect("empty item exits");
         assert_eq!(next, "- one\n");
         assert_eq!(cursor, 6);
+
+        let (next, cursor) =
+            smart_markdown_enter("  - ", 4..4).expect("nested empty item outdents");
+        assert_eq!(next, "- ");
+        assert_eq!(cursor, 2);
+
+        let (next, cursor) =
+            smart_markdown_enter("    - [ ] ", 10..10).expect("nested task outdents one level");
+        assert_eq!(next, "  - [ ] ");
+        assert_eq!(cursor, 8);
     }
 
     #[test]
