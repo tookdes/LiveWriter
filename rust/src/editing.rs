@@ -331,6 +331,291 @@ pub fn markdown_link(text: &str, url: &str) -> String {
     format!("[{label}]({href})")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkdownLink {
+    pub range: Range<usize>,
+    pub image: bool,
+    pub label: String,
+    pub url: String,
+}
+
+fn next_char_index(text: &str, index: usize) -> usize {
+    text[index..]
+        .chars()
+        .next()
+        .map(|ch| index + ch.len_utf8())
+        .unwrap_or(text.len())
+}
+
+fn skip_ascii_ws(text: &str, mut index: usize) -> usize {
+    while index < text.len() && matches!(text.as_bytes()[index], b' ' | b'\t') {
+        index += 1;
+    }
+    index
+}
+
+fn parse_link_destination(text: &str, mut index: usize) -> Option<(String, usize)> {
+    index = skip_ascii_ws(text, index);
+    if index >= text.len() {
+        return None;
+    }
+    if text.as_bytes()[index] == b'<' {
+        let start = index + 1;
+        let mut cursor = start;
+        while cursor < text.len() {
+            match text.as_bytes()[cursor] {
+                b'>' => return Some((text[start..cursor].to_owned(), cursor + 1)),
+                b'\n' => return None,
+                _ => cursor = next_char_index(text, cursor),
+            }
+        }
+        return None;
+    }
+    let start = index;
+    let mut depth = 0i32;
+    while index < text.len() {
+        if is_escaped(text, index) {
+            index = next_char_index(text, index);
+            continue;
+        }
+        match text.as_bytes()[index] {
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            b' ' | b'\t' | b'\n' | b'\r' => break,
+            _ => {}
+        }
+        index = next_char_index(text, index);
+    }
+    if index == start {
+        return None;
+    }
+    Some((text[start..index].to_owned(), index))
+}
+
+fn skip_optional_title(text: &str, mut index: usize) -> usize {
+    index = skip_ascii_ws(text, index);
+    let Some(&quote) = text.as_bytes().get(index) else {
+        return index;
+    };
+    if quote != b'"' && quote != b'\'' {
+        return index;
+    }
+    index += 1;
+    while index < text.len() {
+        if !is_escaped(text, index) && text.as_bytes()[index] == quote {
+            return skip_ascii_ws(text, index + 1);
+        }
+        index = next_char_index(text, index);
+    }
+    index
+}
+
+fn parse_markdown_link_at(text: &str, open: usize) -> Option<MarkdownLink> {
+    if open >= text.len() || !text.is_char_boundary(open) || is_escaped(text, open) {
+        return None;
+    }
+    let mut index = open;
+    let mut image = false;
+    if text.as_bytes()[index] == b'!' {
+        image = true;
+        index += 1;
+        if index >= text.len() {
+            return None;
+        }
+    }
+    if text.as_bytes().get(index) != Some(&b'[') {
+        return None;
+    }
+    index += 1;
+    let label_start = index;
+    let mut depth = 1i32;
+    while index < text.len() {
+        if is_escaped(text, index) {
+            index = next_char_index(text, index);
+            continue;
+        }
+        match text.as_bytes()[index] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            b'\n' => return None,
+            _ => {}
+        }
+        index = next_char_index(text, index);
+    }
+    if depth != 0 {
+        return None;
+    }
+    let label = text[label_start..index].to_owned();
+    index += 1;
+    if text.as_bytes().get(index) != Some(&b'(') {
+        return None;
+    }
+    let (url, next) = parse_link_destination(text, index + 1)?;
+    index = skip_optional_title(text, next);
+    if text.as_bytes().get(index) != Some(&b')') {
+        return None;
+    }
+    Some(MarkdownLink {
+        range: open..index + 1,
+        image,
+        label,
+        url,
+    })
+}
+
+/// Find the innermost `[label](url)` or `![alt](url)` covering `range`.
+pub fn markdown_link_at(text: &str, range: Range<usize>) -> Option<MarkdownLink> {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len()).max(start);
+    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return None;
+    }
+
+    if start < end {
+        if let Some(link) = parse_markdown_link_at(text, start)
+            && link.range == (start..end)
+        {
+            return Some(link);
+        }
+        if start > 0
+            && text.as_bytes()[start] == b'['
+            && text.as_bytes()[start - 1] == b'!'
+            && let Some(link) = parse_markdown_link_at(text, start - 1)
+            && link.range.end == end
+        {
+            return Some(link);
+        }
+    }
+
+    let search_from = start.saturating_sub(2000);
+    let mut best: Option<MarkdownLink> = None;
+    let mut index = search_from;
+    while index <= end && index < text.len() {
+        if !text.is_char_boundary(index) {
+            index += 1;
+            continue;
+        }
+        if is_escaped(text, index) {
+            index = next_char_index(text, index);
+            continue;
+        }
+        let bytes = text.as_bytes();
+        let open = match bytes[index] {
+            b'!' if bytes.get(index + 1) == Some(&b'[') => index,
+            b'[' => {
+                if index > 0 && bytes[index - 1] == b'!' && !is_escaped(text, index - 1) {
+                    index = next_char_index(text, index);
+                    continue;
+                }
+                index
+            }
+            _ => {
+                index = next_char_index(text, index);
+                continue;
+            }
+        };
+        if let Some(link) = parse_markdown_link_at(text, open)
+            && link.range.start <= start
+            && link.range.end >= end
+            && best
+                .as_ref()
+                .is_none_or(|current| link.range.len() <= current.range.len())
+        {
+            best = Some(link);
+        }
+        index = next_char_index(text, open);
+    }
+    best
+}
+
+pub fn find_markdown_image(text: &str, url: &str, alt: &str) -> Option<MarkdownLink> {
+    let mut index = 0usize;
+    let mut fallback = None;
+    while index < text.len() {
+        if !text.is_char_boundary(index) {
+            index += 1;
+            continue;
+        }
+        if text.as_bytes()[index] == b'!'
+            && let Some(link) = parse_markdown_link_at(text, index)
+        {
+            if link.image && link.url == url {
+                if link.label == alt {
+                    return Some(link);
+                }
+                if fallback.is_none() {
+                    fallback = Some(link.clone());
+                }
+            }
+            index = link.range.end;
+            continue;
+        }
+        index = next_char_index(text, index);
+    }
+    fallback
+}
+
+pub fn format_inline_link(image: bool, label: &str, url: &str) -> String {
+    if image {
+        format!("![{label}]({})", url.trim())
+    } else {
+        markdown_link(label, url)
+    }
+}
+
+pub fn replace_span(text: &str, range: Range<usize>, replacement: &str) -> (String, usize) {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len()).max(start);
+    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return (text.to_owned(), end);
+    }
+    let mut next = String::with_capacity(text.len() - (end - start) + replacement.len());
+    next.push_str(&text[..start]);
+    next.push_str(replacement);
+    next.push_str(&text[end..]);
+    (next, start + replacement.len())
+}
+
+pub fn delete_block_span(text: &str, range: Range<usize>) -> (String, usize) {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len()).max(start);
+    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return (text.to_owned(), start);
+    }
+    let line_start = text[..start]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let line_end = text[end..]
+        .find('\n')
+        .map(|index| end + index)
+        .unwrap_or(text.len());
+    if text[line_start..start].trim().is_empty() && text[end..line_end].trim().is_empty() {
+        let mut from = line_start;
+        let to = if line_end < text.len() {
+            line_end + 1
+        } else {
+            line_end
+        };
+        if to == text.len() && from > 0 && text.as_bytes()[from - 1] == b'\n' {
+            from -= 1;
+        }
+        replace_span(text, from..to, "")
+    } else {
+        replace_span(text, start..end, "")
+    }
+}
+
 pub fn markdown_code_block(language: &str) -> String {
     let language = language.trim();
     if language.is_empty() {
@@ -456,6 +741,497 @@ pub fn selection_has_wrap(text: &str, range: Range<usize>, prefix: &str, suffix:
             && text[end..].starts_with(suffix))
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InlineFormatState {
+    pub bold: bool,
+    pub italic: bool,
+    pub strike: bool,
+    pub code: bool,
+}
+
+fn is_escaped(text: &str, index: usize) -> bool {
+    let bytes = text.as_bytes();
+    let mut cursor = index;
+    let mut slashes = 0usize;
+    while cursor > 0 && bytes[cursor - 1] == b'\\' {
+        slashes += 1;
+        cursor -= 1;
+    }
+    slashes % 2 == 1
+}
+
+fn marker_positions(line: &str, marker: &str, isolated_single: bool) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let mut search_from = 0usize;
+    let bytes = line.as_bytes();
+    let marker_byte = marker.as_bytes().first().copied();
+
+    while search_from < line.len() {
+        let Some(relative) = line[search_from..].find(marker) else {
+            break;
+        };
+        let index = search_from + relative;
+        let mut accepted = !is_escaped(line, index);
+        if accepted
+            && isolated_single
+            && marker.len() == 1
+            && let Some(byte) = marker_byte
+        {
+            accepted = bytes.get(index.wrapping_sub(1)).copied() != Some(byte)
+                && bytes.get(index + 1).copied() != Some(byte);
+        }
+        if accepted {
+            positions.push(index);
+        }
+        search_from = index + marker.len();
+    }
+
+    positions
+}
+
+fn marker_active_in_context(
+    text: &str,
+    range: Range<usize>,
+    marker: &str,
+    isolated_single: bool,
+) -> bool {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len()).max(start);
+    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return false;
+    }
+
+    if selection_has_wrap(text, start..end, marker, marker) {
+        return true;
+    }
+
+    let line_start = text[..start]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let line_end = text[end..]
+        .find('\n')
+        .map(|index| end + index)
+        .unwrap_or(text.len());
+    if text[start..end].contains('\n') {
+        return false;
+    }
+
+    let line = &text[line_start..line_end];
+    let local_start = start - line_start;
+    let local_end = end - line_start;
+    let positions = marker_positions(line, marker, isolated_single);
+
+    for pair in positions.as_slice().as_chunks::<2>().0 {
+        let open = pair[0];
+        let close = pair[1];
+        let inner_start = open + marker.len();
+        let inner_end = close;
+        if local_start >= inner_start && local_end <= inner_end {
+            return true;
+        }
+        if local_start == open && local_end == close + marker.len() {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub fn inline_format_state(text: &str, range: Range<usize>) -> InlineFormatState {
+    InlineFormatState {
+        bold: marker_active_in_context(text, range.clone(), "**", false),
+        italic: marker_active_in_context(text, range.clone(), "*", true),
+        strike: marker_active_in_context(text, range.clone(), "~~", false),
+        code: marker_active_in_context(text, range, "`", true),
+    }
+}
+
+pub fn linkify_selection(text: &str, range: Range<usize>, url: &str) -> Option<(String, usize)> {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len()).max(start);
+    if start == end
+        || !text.is_char_boundary(start)
+        || !text.is_char_boundary(end)
+        || !is_clipboard_url(url)
+    {
+        return None;
+    }
+
+    let selected = &text[start..end];
+    if selected.is_empty()
+        || selected.trim() != selected
+        || selected.contains('\n')
+        || looks_like_url(selected)
+    {
+        return None;
+    }
+
+    let snippet = markdown_link(selected, &normalize_url(url));
+    let mut next = String::with_capacity(text.len() - selected.len() + snippet.len());
+    next.push_str(&text[..start]);
+    next.push_str(&snippet);
+    next.push_str(&text[end..]);
+    let cursor = start + snippet.len();
+    Some((next, cursor))
+}
+
+const MARKDOWN_NEST_INDENT: &str = "  ";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkdownContinuation {
+    Bullet(char),
+    Task,
+    Numbered { number: u64, delimiter: char },
+    Quote,
+}
+
+fn leading_whitespace_len(line: &str) -> usize {
+    line.bytes()
+        .take_while(|byte| *byte == b' ' || *byte == b'\t')
+        .count()
+}
+
+fn markdown_continuation(line: &str) -> Option<(usize, usize, MarkdownContinuation)> {
+    let indent_len = leading_whitespace_len(line);
+    let rest = &line[indent_len..];
+
+    for prefix in ["- [ ] ", "- [x] ", "- [X] "] {
+        if rest.starts_with(prefix) {
+            return Some((indent_len, prefix.len(), MarkdownContinuation::Task));
+        }
+    }
+
+    for marker in ['-', '*', '+'] {
+        let prefix = format!("{marker} ");
+        if rest.starts_with(&prefix) {
+            return Some((
+                indent_len,
+                prefix.len(),
+                MarkdownContinuation::Bullet(marker),
+            ));
+        }
+    }
+
+    let quote_len = quote_marker_len(rest);
+    if quote_len > 0 {
+        return Some((indent_len, quote_len, MarkdownContinuation::Quote));
+    }
+
+    let bytes = rest.as_bytes();
+    let digits = bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits > 0 {
+        let delimiter = match bytes.get(digits) {
+            Some(b'.') => '.',
+            Some(b')') => ')',
+            _ => return None,
+        };
+        if bytes.get(digits + 1) == Some(&b' ') {
+            let number = rest[..digits].parse::<u64>().ok()?;
+            return Some((
+                indent_len,
+                digits + 2,
+                MarkdownContinuation::Numbered { number, delimiter },
+            ));
+        }
+    }
+
+    None
+}
+
+fn quote_marker_len(rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    if bytes.first().copied() != Some(b'>') {
+        return 0;
+    }
+    let mut index = 0;
+    while index < bytes.len() && bytes[index] == b'>' {
+        index += 1;
+        if index < bytes.len() && bytes[index] == b' ' {
+            index += 1;
+        }
+    }
+    index
+}
+
+fn outdent_quote_prefix(prefix: &str) -> Option<String> {
+    let bytes = prefix.as_bytes();
+    if bytes.first().copied() != Some(b'>') {
+        return None;
+    }
+    let mut index = 1;
+    if index < bytes.len() && bytes[index] == b' ' {
+        index += 1;
+    }
+    if index >= prefix.len() {
+        return None;
+    }
+    Some(prefix[index..].to_owned())
+}
+
+fn next_markdown_prefix(kind: MarkdownContinuation, marker: &str) -> String {
+    match kind {
+        MarkdownContinuation::Bullet(ch) => format!("{ch} "),
+        MarkdownContinuation::Task => "- [ ] ".to_owned(),
+        MarkdownContinuation::Numbered { number, delimiter } => {
+            format!("{}{delimiter} ", number.saturating_add(1))
+        }
+        MarkdownContinuation::Quote => marker.to_owned(),
+    }
+}
+
+/// Return a Markdown-aware replacement for Enter.
+///
+/// Ordinary paragraphs intentionally return no replacement so the native input
+/// keeps its normal newline behavior. Lists, tasks, numbered lists, and quotes
+/// are continued. Pressing Enter on an empty structural item removes its marker,
+/// which exits that block without inserting an additional blank line.
+pub fn smart_markdown_enter(text: &str, range: Range<usize>) -> Option<(String, usize)> {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len()).max(start);
+    if start != end || !text.is_char_boundary(start) {
+        return None;
+    }
+
+    let starts = line_starts(text);
+    let line = line_index(&starts, start);
+    let line_start = starts[line];
+    let line_stop = line_end(&starts, line, text.len());
+    let line_text = &text[line_start..line_stop];
+    let local_cursor = start.saturating_sub(line_start).min(line_text.len());
+    let (indent_len, marker_len, kind) = markdown_continuation(line_text)?;
+
+    if local_cursor < indent_len + marker_len {
+        return None;
+    }
+
+    let body = &line_text[indent_len + marker_len..];
+    if body.trim().is_empty() {
+        if kind == MarkdownContinuation::Quote {
+            let prefix = &line_text[indent_len..indent_len + marker_len];
+            if let Some(next_prefix) = outdent_quote_prefix(prefix) {
+                let new_line = format!("{}{}{}", &line_text[..indent_len], next_prefix, body);
+                let mut next = String::with_capacity(text.len() - line_text.len() + new_line.len());
+                next.push_str(&text[..line_start]);
+                next.push_str(&new_line);
+                next.push_str(&text[line_stop..]);
+                return Some((next, line_start + new_line.len()));
+            }
+        }
+        if indent_len > 0 {
+            let remove = if line_text.starts_with(MARKDOWN_NEST_INDENT) {
+                MARKDOWN_NEST_INDENT.len()
+            } else if line_text.starts_with('\t') || line_text.starts_with(' ') {
+                1
+            } else {
+                0
+            };
+            if remove > 0 {
+                let mut next = String::with_capacity(text.len().saturating_sub(remove));
+                next.push_str(&text[..line_start]);
+                next.push_str(&line_text[remove..]);
+                next.push_str(&text[line_stop..]);
+                return Some((next, start.saturating_sub(remove)));
+            }
+        }
+
+        let mut next = String::with_capacity(text.len().saturating_sub(line_text.len()));
+        next.push_str(&text[..line_start]);
+        next.push_str(&text[line_stop..]);
+        return Some((next, line_start));
+    }
+
+    let indent = &line_text[..indent_len];
+    let marker = &line_text[indent_len..indent_len + marker_len];
+    let prefix = next_markdown_prefix(kind, marker);
+    let insertion = format!("\n{indent}{prefix}");
+    let mut next = String::with_capacity(text.len() + insertion.len());
+    next.push_str(&text[..start]);
+    next.push_str(&insertion);
+    next.push_str(&text[start..]);
+    Some((next, start + insertion.len()))
+}
+
+fn markdown_list_line(line: &str) -> bool {
+    matches!(
+        markdown_continuation(line).map(|(_, _, kind)| kind),
+        Some(
+            MarkdownContinuation::Bullet(_)
+                | MarkdownContinuation::Task
+                | MarkdownContinuation::Numbered { .. }
+                | MarkdownContinuation::Quote
+        )
+    )
+}
+
+fn indent_quote_line(line: &str) -> String {
+    let indent = leading_whitespace_len(line);
+    format!("{}> {}", &line[..indent], &line[indent..])
+}
+
+fn outdent_quote_line(line: &str) -> Option<String> {
+    let indent = leading_whitespace_len(line);
+    let rest = &line[indent..];
+    let marker_len = quote_marker_len(rest);
+    if marker_len == 0 {
+        return None;
+    }
+    let next_prefix = outdent_quote_prefix(&rest[..marker_len])?;
+    Some(format!(
+        "{}{}{}",
+        &line[..indent],
+        next_prefix,
+        &rest[marker_len..]
+    ))
+}
+
+/// Indent or outdent the selected Markdown list lines by one native nesting level.
+///
+/// The preview parser already recognizes two leading spaces as one nested list
+/// level, so this keeps editing behavior aligned with preview semantics.
+pub fn adjust_markdown_list_indent(
+    text: &str,
+    range: Range<usize>,
+    outdent: bool,
+) -> Option<(String, usize)> {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len()).max(start);
+    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return None;
+    }
+
+    let starts = line_starts(text);
+    let (start_line, end_line) = selected_line_span(text, start..end);
+    let mut saw_list = false;
+    let mut changed = false;
+    let mut cursor = end;
+    let mut replacement = String::new();
+
+    for line in start_line..=end_line {
+        if line > start_line {
+            replacement.push('\n');
+        }
+        let line_start = starts[line];
+        let line_stop = line_end(&starts, line, text.len());
+        let line_text = &text[line_start..line_stop];
+
+        if line_text.trim().is_empty() {
+            replacement.push_str(line_text);
+            continue;
+        }
+        if !markdown_list_line(line_text) {
+            return None;
+        }
+        saw_list = true;
+
+        let is_quote = matches!(
+            markdown_continuation(line_text).map(|(_, _, kind)| kind),
+            Some(MarkdownContinuation::Quote)
+        );
+        if is_quote {
+            if outdent {
+                if let Some(next_line) = outdent_quote_line(line_text) {
+                    changed = true;
+                    let removed = line_text.len().saturating_sub(next_line.len());
+                    replacement.push_str(&next_line);
+                    if line_start <= end {
+                        cursor = cursor.saturating_sub(removed);
+                    }
+                } else {
+                    replacement.push_str(line_text);
+                }
+            } else {
+                let next_line = indent_quote_line(line_text);
+                changed = true;
+                let added = next_line.len().saturating_sub(line_text.len());
+                replacement.push_str(&next_line);
+                if line_start <= end {
+                    cursor = cursor.saturating_add(added);
+                }
+            }
+            continue;
+        }
+
+        if outdent {
+            let remove = if line_text.starts_with(MARKDOWN_NEST_INDENT) {
+                MARKDOWN_NEST_INDENT.len()
+            } else if line_text.starts_with('\t') || line_text.starts_with(' ') {
+                1
+            } else {
+                0
+            };
+            if remove > 0 {
+                changed = true;
+                replacement.push_str(&line_text[remove..]);
+                if line_start <= end {
+                    cursor = cursor.saturating_sub(remove);
+                }
+            } else {
+                replacement.push_str(line_text);
+            }
+        } else {
+            changed = true;
+            replacement.push_str(MARKDOWN_NEST_INDENT);
+            replacement.push_str(line_text);
+            if line_start <= end {
+                cursor = cursor.saturating_add(MARKDOWN_NEST_INDENT.len());
+            }
+        }
+    }
+
+    if !saw_list || !changed {
+        return None;
+    }
+
+    let replace_start = starts[start_line];
+    let replace_end = line_end(&starts, end_line, text.len());
+    let mut next = String::with_capacity(
+        text.len()
+            + replacement
+                .len()
+                .saturating_sub(replace_end - replace_start),
+    );
+    next.push_str(&text[..replace_start]);
+    next.push_str(&replacement);
+    next.push_str(&text[replace_end..]);
+    let next_cursor = cursor.min(next.len());
+    Some((next, next_cursor))
+}
+
+/// Toggle the task checkbox on the line containing the cursor.
+pub fn toggle_markdown_task(text: &str, cursor: usize) -> Option<(String, usize)> {
+    let cursor = cursor.min(text.len());
+    if !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let starts = line_starts(text);
+    let line = line_index(&starts, cursor);
+    let line_start = starts[line];
+    let line_stop = line_end(&starts, line, text.len());
+    let line_text = &text[line_start..line_stop];
+    let indent_len = leading_whitespace_len(line_text);
+    let rest = &line_text[indent_len..];
+
+    let replacement = if rest.starts_with("- [ ] ") {
+        "- [x] "
+    } else if rest.starts_with("- [x] ") || rest.starts_with("- [X] ") {
+        "- [ ] "
+    } else {
+        return None;
+    };
+
+    let marker_start = line_start + indent_len;
+    let marker_end = marker_start + 6;
+    let mut next = String::with_capacity(text.len());
+    next.push_str(&text[..marker_start]);
+    next.push_str(replacement);
+    next.push_str(&text[marker_end..]);
+    Some((next, cursor))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +1282,181 @@ mod tests {
         assert_eq!(line, "- quote");
     }
 
+    #[test]
+    fn smart_enter_continues_markdown_blocks_and_exits_empty_items() {
+        let (next, cursor) = smart_markdown_enter("- one", 5..5).expect("bullet continuation");
+        assert_eq!(next, "- one\n- ");
+        assert_eq!(cursor, next.len());
+
+        let (next, cursor) = smart_markdown_enter("- [x] done", 10..10).expect("task continuation");
+        assert_eq!(next, "- [x] done\n- [ ] ");
+        assert_eq!(cursor, next.len());
+
+        let (next, cursor) = smart_markdown_enter("9. nine", 7..7).expect("number continuation");
+        assert_eq!(next, "9. nine\n10. ");
+        assert_eq!(cursor, next.len());
+
+        let (next, cursor) = smart_markdown_enter("> quote", 7..7).expect("quote continuation");
+        assert_eq!(next, "> quote\n> ");
+        assert_eq!(cursor, next.len());
+
+        let (next, cursor) = smart_markdown_enter("- one\n- ", 8..8).expect("empty item exits");
+        assert_eq!(next, "- one\n");
+        assert_eq!(cursor, 6);
+
+        let (next, cursor) =
+            smart_markdown_enter("  - ", 4..4).expect("nested empty item outdents");
+        assert_eq!(next, "- ");
+        assert_eq!(cursor, 2);
+
+        let (next, cursor) =
+            smart_markdown_enter("    - [ ] ", 10..10).expect("nested task outdents one level");
+        assert_eq!(next, "  - [ ] ");
+        assert_eq!(cursor, 8);
+    }
+
+    #[test]
+    fn smart_enter_splits_a_list_item_at_the_caret() {
+        let source = "  - hello world";
+        let caret = source.find('o').expect("letter o in hello");
+        let (next, cursor) =
+            smart_markdown_enter(source, caret..caret).expect("nested bullet continuation");
+        assert_eq!(next, "  - hell\n  - o world");
+        assert_eq!(&next[cursor..], "o world");
+    }
+
+    #[test]
+    fn smart_enter_continues_nested_quotes_and_outdents_one_level() {
+        let (next, cursor) =
+            smart_markdown_enter("> > quoted", 10..10).expect("nested quote continuation");
+        assert_eq!(next, "> > quoted\n> > ");
+        assert_eq!(cursor, next.len());
+
+        let (next, cursor) =
+            smart_markdown_enter("> > ", 4..4).expect("nested quote outdents one level");
+        assert_eq!(next, "> ");
+        assert_eq!(cursor, 2);
+
+        let (next, cursor) = smart_markdown_enter("> ", 2..2).expect("top-level quote exits");
+        assert_eq!(next, "");
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn tab_nests_quotes_without_touching_plain_paragraphs() {
+        let (nested, _) = adjust_markdown_list_indent("> one", 0..0, false).expect("quote indent");
+        assert_eq!(nested, "> > one");
+        let (flat, _) = adjust_markdown_list_indent(&nested, 0..0, true).expect("quote outdent");
+        assert_eq!(flat, "> one");
+        assert!(adjust_markdown_list_indent("> one", 0..0, true).is_none());
+        assert!(adjust_markdown_list_indent("plain", 0..0, false).is_none());
+    }
+
+    #[test]
+    fn adjusts_only_markdown_list_indentation() {
+        let source = "- one\n- two";
+        let (nested, cursor) =
+            adjust_markdown_list_indent(source, 0..source.len(), false).expect("indent");
+        assert_eq!(nested, "  - one\n  - two");
+        assert_eq!(cursor, nested.len());
+
+        let (flat, cursor) =
+            adjust_markdown_list_indent(&nested, 0..nested.len(), true).expect("outdent");
+        assert_eq!(flat, source);
+        assert_eq!(cursor, source.len());
+
+        assert!(adjust_markdown_list_indent("plain", 0..0, false).is_none());
+        assert!(adjust_markdown_list_indent("- top", 0..0, true).is_none());
+    }
+
+    #[test]
+    fn toggles_task_checkbox_without_moving_the_caret() {
+        let (checked, cursor) = toggle_markdown_task("  - [ ] task", 10).expect("check task");
+        assert_eq!(checked, "  - [x] task");
+        assert_eq!(cursor, 10);
+
+        let (unchecked, cursor) = toggle_markdown_task(&checked, cursor).expect("uncheck task");
+        assert_eq!(unchecked, "  - [ ] task");
+        assert_eq!(cursor, 10);
+        assert!(toggle_markdown_task("- bullet", 4).is_none());
+    }
+
+    #[test]
+    fn detects_inline_format_at_the_caret_and_selection() {
+        let source = "**bold** and *italic* and ~~strike~~ and `code`";
+        assert!(inline_format_state(source, 4..4).bold);
+        assert!(inline_format_state(source, 2..6).bold);
+        assert!(inline_format_state(source, 15..15).italic);
+        assert!(inline_format_state(source, 29..29).strike);
+        assert!(inline_format_state(source, 42..42).code);
+        assert_eq!(
+            inline_format_state(source, source.len()..source.len()),
+            InlineFormatState::default()
+        );
+
+        let nested = "**bold *and italic* text**";
+        let state = inline_format_state(nested, 12..12);
+        assert!(state.bold);
+        assert!(state.italic);
+
+        let escaped = r"\*not italic\*";
+        assert!(!inline_format_state(escaped, 5..5).italic);
+    }
+
+    #[test]
+    fn detects_and_rewrites_the_link_or_image_under_the_caret() {
+        let source = "see [OpenAI](https://openai.com) now";
+        let link = markdown_link_at(source, 6..6).expect("caret in label");
+        assert!(!link.image);
+        assert_eq!(link.label, "OpenAI");
+        assert_eq!(link.url, "https://openai.com");
+        assert_eq!(&source[link.range.clone()], "[OpenAI](https://openai.com)");
+
+        let image = markdown_link_at("before ![alt](pic.png) after", 10..10).expect("image");
+        assert!(image.image);
+        assert_eq!(image.label, "alt");
+        assert_eq!(image.url, "pic.png");
+
+        let titled = markdown_link_at("[docs](https://ex.com/a \"Docs\")", 2..2).expect("title");
+        assert_eq!(titled.url, "https://ex.com/a");
+
+        let inner = markdown_link_at("see [foo [bar](x.com)](y.com)", 10..10).expect("inner");
+        assert_eq!(inner.label, "bar");
+        assert_eq!(inner.url, "x.com");
+
+        assert!(markdown_link_at("no link here", 3..3).is_none());
+        assert!(markdown_link_at("abc \\[skip](url)", 8..8).is_none());
+
+        let found = find_markdown_image("a ![one](a.png) b ![two](a.png)", "a.png", "two")
+            .expect("alt match");
+        assert_eq!(found.label, "two");
+
+        let (next, _) = replace_span(
+            source,
+            link.range.clone(),
+            "[Docs](https://docs.openai.com)",
+        );
+        assert_eq!(next, "see [Docs](https://docs.openai.com) now");
+
+        let block = "para\n![alt](pic.png)\nmore";
+        let image = markdown_link_at(block, 8..8).expect("block image");
+        let (next, _) = delete_block_span(block, image.range);
+        assert_eq!(next, "para\nmore");
+        let inline = "keep ![alt](pic.png) text";
+        let image = markdown_link_at(inline, 8..8).expect("inline image");
+        let (next, _) = delete_block_span(inline, image.range);
+        assert_eq!(next, "keep  text");
+    }
+
+    #[test]
+    fn linkifies_a_clean_text_selection_from_a_url_paste() {
+        let (next, cursor) =
+            linkify_selection("read this now", 5..9, "www.example.com").expect("link");
+        assert_eq!(next, "read [this](https://www.example.com) now");
+        assert_eq!(cursor, "read [this](https://www.example.com)".len());
+        assert!(linkify_selection("https://old.example", 0..19, "https://new.example").is_none());
+        assert!(linkify_selection("two words", 0..9, "not a url").is_none());
+    }
     #[test]
     fn builds_tables_and_counts_characters() {
         let table = markdown_table(2, 3);
