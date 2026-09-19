@@ -287,11 +287,7 @@ impl MarkdownInput {
         })
     }
 
-    fn visual_context(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> EditorVisualContext {
+    fn visual_context(&self, window: &mut Window, cx: &mut Context<Self>) -> EditorVisualContext {
         let range = self.current_range(window, cx);
         let full = self.state.read(cx).text().to_string();
         let cursor = range.end.min(full.len());
@@ -299,10 +295,7 @@ impl MarkdownInput {
         let line = crate::editing::line_index(&starts, cursor);
         let start = starts[line];
         let end = crate::editing::line_end(&starts, line, full.len());
-        EditorVisualContext::from_line(
-            &full[start..end],
-            inline_format_state(&full, range),
-        )
+        EditorVisualContext::from_line(&full[start..end], inline_format_state(&full, range))
     }
 
     fn context_state(
@@ -561,7 +554,11 @@ impl EditorVisualContext {
                 while digits < bytes.len() && bytes[digits].is_ascii_digit() {
                     digits += 1;
                 }
-                let marker_len = if digits < bytes.len() { digits + 1 } else { digits };
+                let marker_len = if digits < bytes.len() {
+                    digits + 1
+                } else {
+                    digits
+                };
                 marker = trimmed[..marker_len.min(trimmed.len())].to_owned();
                 body = trimmed
                     .get((digits + 2).min(trimmed.len())..)
@@ -3593,8 +3590,8 @@ impl Render for MarkdownEditor {
             .on_drop(cx.listener(|editor, paths: &ExternalPaths, _, cx| {
                 editor.drop_images(paths, cx);
             }))
-            .capture_action(
-                cx.listener(|editor, action: &gpui_component::input::Enter, window, cx| {
+            .capture_action(cx.listener(
+                |editor, action: &gpui_component::input::Enter, window, cx| {
                     let focused = editor
                         .text_input
                         .read(cx)
@@ -3614,8 +3611,8 @@ impl Render for MarkdownEditor {
                         cx.stop_propagation();
                         cx.notify();
                     }
-                }),
-            )
+                },
+            ))
             .capture_action(
                 cx.listener(|editor, _: &gpui_component::input::Indent, window, cx| {
                     let focused = editor
@@ -3624,9 +3621,9 @@ impl Render for MarkdownEditor {
                         .focus_handle(cx)
                         .is_focused(window);
                     if focused
-                        && editor.text_input.update(cx, |input, cx| {
-                            input.adjust_list_indent(false, window, cx)
-                        })
+                        && editor
+                            .text_input
+                            .update(cx, |input, cx| input.adjust_list_indent(false, window, cx))
                     {
                         editor.status = "列表已缩进一级".into();
                         cx.stop_propagation();
@@ -3634,24 +3631,24 @@ impl Render for MarkdownEditor {
                     }
                 }),
             )
-            .capture_action(
-                cx.listener(|editor, _: &gpui_component::input::Outdent, window, cx| {
+            .capture_action(cx.listener(
+                |editor, _: &gpui_component::input::Outdent, window, cx| {
                     let focused = editor
                         .text_input
                         .read(cx)
                         .focus_handle(cx)
                         .is_focused(window);
                     if focused
-                        && editor.text_input.update(cx, |input, cx| {
-                            input.adjust_list_indent(true, window, cx)
-                        })
+                        && editor
+                            .text_input
+                            .update(cx, |input, cx| input.adjust_list_indent(true, window, cx))
                     {
                         editor.status = "列表已减少一级缩进".into();
                         cx.stop_propagation();
                         cx.notify();
                     }
-                }),
-            )
+                },
+            ))
             .capture_action(
                 cx.listener(|editor, _: &gpui_component::input::Paste, window, cx| {
                     let Some(item) = cx.read_from_clipboard() else {
@@ -4124,31 +4121,13 @@ fn editor_inline_badges(state: InlineFormatState) -> impl IntoElement {
             )
         })
         .when(state.italic, |this| {
-            this.child(
-                div()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(rgb(0xe7f0f9))
-                    .child("I"),
-            )
+            this.child(div().px_1().rounded_sm().bg(rgb(0xe7f0f9)).child("I"))
         })
         .when(state.strike, |this| {
-            this.child(
-                div()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(rgb(0xe7f0f9))
-                    .child("S"),
-            )
+            this.child(div().px_1().rounded_sm().bg(rgb(0xe7f0f9)).child("S"))
         })
         .when(state.code, |this| {
-            this.child(
-                div()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(rgb(0xe7f0f9))
-                    .child("</>"),
-            )
+            this.child(div().px_1().rounded_sm().bg(rgb(0xe7f0f9)).child("</>"))
         })
 }
 
@@ -4233,12 +4212,7 @@ fn editor_prose_lens(context: EditorVisualContext) -> AnyElement {
                 .items_center()
                 .gap_3()
                 .min_w_0()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x8796a5))
-                        .child("排版"),
-                )
+                .child(div().text_xs().text_color(rgb(0x8796a5)).child("排版"))
                 .child(content),
         )
         .child(editor_inline_badges(inline))
