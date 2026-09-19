@@ -4659,7 +4659,7 @@ fn ribbon_compact_toggle(
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
-        .id((label, "toggle"))
+        .id(label)
         .w(px(28.))
         .h(px(23.))
         .flex()
@@ -4668,11 +4668,7 @@ fn ribbon_compact_toggle(
         .justify_center()
         .rounded_sm()
         .border_1()
-        .border_color(if selected {
-            rgb(0x5b91c2)
-        } else {
-            hsla(0., 0., 0., 0.)
-        })
+        .border_color(rgb(if selected { 0x5b91c2 } else { RIBBON_BLUE }))
         .when(selected, |style| style.bg(rgb(0xc8dff2)))
         .hover(|style| {
             style
@@ -4697,7 +4693,7 @@ fn ribbon_small_toggle(
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
-        .id((label, "toggle"))
+        .id(label)
         .min_w(px(84.))
         .h(RIBBON_SMALL_BUTTON_HEIGHT)
         .flex()
@@ -4707,11 +4703,7 @@ fn ribbon_small_toggle(
         .px_1()
         .rounded_sm()
         .border_1()
-        .border_color(if selected {
-            rgb(0x5b91c2)
-        } else {
-            hsla(0., 0., 0., 0.)
-        })
+        .border_color(rgb(if selected { 0x5b91c2 } else { RIBBON_BLUE }))
         .when(selected, |style| style.bg(rgb(0xc8dff2)))
         .text_size(px(12.))
         .text_color(rgb(TEXT))
@@ -4747,7 +4739,7 @@ fn ribbon_large_toggle(
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
-        .id((label, "toggle"))
+        .id(label)
         .w(RIBBON_LARGE_BUTTON_WIDTH)
         .h(RIBBON_LARGE_BUTTON_HEIGHT)
         .flex()
@@ -4759,11 +4751,7 @@ fn ribbon_large_toggle(
         .px_1()
         .rounded_sm()
         .border_1()
-        .border_color(if selected {
-            rgb(0x5b91c2)
-        } else {
-            hsla(0., 0., 0., 0.)
-        })
+        .border_color(rgb(if selected { 0x5b91c2 } else { RIBBON_BLUE }))
         .when(selected, |style| style.bg(rgb(0xc8dff2)))
         .text_xs()
         .text_color(rgb(TEXT))
