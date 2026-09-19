@@ -822,7 +822,7 @@ fn marker_active_in_context(
     let local_end = end - line_start;
     let positions = marker_positions(line, marker, isolated_single);
 
-    for pair in positions.chunks_exact(2) {
+    for pair in positions.as_slice().as_chunks::<2>().0 {
         let open = pair[0];
         let close = pair[1];
         let inner_start = open + marker.len();
