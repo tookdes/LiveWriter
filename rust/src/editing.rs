@@ -456,6 +456,141 @@ pub fn selection_has_wrap(text: &str, range: Range<usize>, prefix: &str, suffix:
             && text[end..].starts_with(suffix))
 }
 
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InlineFormatState {
+    pub bold: bool,
+    pub italic: bool,
+    pub strike: bool,
+    pub code: bool,
+}
+
+fn is_escaped(text: &str, index: usize) -> bool {
+    let bytes = text.as_bytes();
+    let mut cursor = index;
+    let mut slashes = 0usize;
+    while cursor > 0 && bytes[cursor - 1] == b'\\' {
+        slashes += 1;
+        cursor -= 1;
+    }
+    slashes % 2 == 1
+}
+
+fn marker_positions(line: &str, marker: &str, isolated_single: bool) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let mut search_from = 0usize;
+    let bytes = line.as_bytes();
+    let marker_byte = marker.as_bytes().first().copied();
+
+    while search_from < line.len() {
+        let Some(relative) = line[search_from..].find(marker) else {
+            break;
+        };
+        let index = search_from + relative;
+        let mut accepted = !is_escaped(line, index);
+        if accepted && isolated_single && marker.len() == 1 {
+            if let Some(byte) = marker_byte {
+                accepted = bytes.get(index.wrapping_sub(1)).copied() != Some(byte)
+                    && bytes.get(index + 1).copied() != Some(byte);
+            }
+        }
+        if accepted {
+            positions.push(index);
+        }
+        search_from = index + marker.len();
+    }
+
+    positions
+}
+
+fn marker_active_in_context(
+    text: &str,
+    range: Range<usize>,
+    marker: &str,
+    isolated_single: bool,
+) -> bool {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len()).max(start);
+    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return false;
+    }
+
+    if selection_has_wrap(text, start..end, marker, marker) {
+        return true;
+    }
+
+    let line_start = text[..start].rfind('\n').map(|index| index + 1).unwrap_or(0);
+    let line_end = text[end..]
+        .find('\n')
+        .map(|index| end + index)
+        .unwrap_or(text.len());
+    if text[start..end].contains('\n') {
+        return false;
+    }
+
+    let line = &text[line_start..line_end];
+    let local_start = start - line_start;
+    let local_end = end - line_start;
+    let positions = marker_positions(line, marker, isolated_single);
+
+    for pair in positions.chunks_exact(2) {
+        let open = pair[0];
+        let close = pair[1];
+        let inner_start = open + marker.len();
+        let inner_end = close;
+        if local_start >= inner_start && local_end <= inner_end {
+            return true;
+        }
+        if local_start == open && local_end == close + marker.len() {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub fn inline_format_state(text: &str, range: Range<usize>) -> InlineFormatState {
+    InlineFormatState {
+        bold: marker_active_in_context(text, range.clone(), "**", false),
+        italic: marker_active_in_context(text, range.clone(), "*", true),
+        strike: marker_active_in_context(text, range.clone(), "~~", false),
+        code: marker_active_in_context(text, range, "`", true),
+    }
+}
+
+pub fn linkify_selection(
+    text: &str,
+    range: Range<usize>,
+    url: &str,
+) -> Option<(String, usize)> {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len()).max(start);
+    if start == end
+        || !text.is_char_boundary(start)
+        || !text.is_char_boundary(end)
+        || !is_clipboard_url(url)
+    {
+        return None;
+    }
+
+    let selected = &text[start..end];
+    if selected.is_empty()
+        || selected.trim() != selected
+        || selected.contains('\n')
+        || looks_like_url(selected)
+    {
+        return None;
+    }
+
+    let snippet = markdown_link(selected, &normalize_url(url));
+    let mut next = String::with_capacity(text.len() - selected.len() + snippet.len());
+    next.push_str(&text[..start]);
+    next.push_str(&snippet);
+    next.push_str(&text[end..]);
+    let cursor = start + snippet.len();
+    Some((next, cursor))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +641,39 @@ mod tests {
         assert_eq!(line, "- quote");
     }
 
+    #[test]
+    fn detects_inline_format_at_the_caret_and_selection() {
+        let source = "**bold** and *italic* and ~~strike~~ and `code`";
+        assert!(inline_format_state(source, 4..4).bold);
+        assert!(inline_format_state(source, 2..6).bold);
+        assert!(inline_format_state(source, 15..15).italic);
+        assert!(inline_format_state(source, 29..29).strike);
+        assert!(inline_format_state(source, 42..42).code);
+        assert_eq!(
+            inline_format_state(source, source.len()..source.len()),
+            InlineFormatState::default()
+        );
+
+        let nested = "**bold *and italic* text**";
+        let state = inline_format_state(nested, 12..12);
+        assert!(state.bold);
+        assert!(state.italic);
+
+        let escaped = r"\*not italic\*";
+        assert!(!inline_format_state(escaped, 5..5).italic);
+    }
+
+    #[test]
+    fn linkifies_a_clean_text_selection_from_a_url_paste() {
+        let (next, cursor) =
+            linkify_selection("read this now", 5..9, "www.example.com").expect("link");
+        assert_eq!(next, "read [this](https://www.example.com) now");
+        assert_eq!(cursor, "read [this](https://www.example.com)".len());
+        assert!(
+            linkify_selection("https://old.example", 0..19, "https://new.example").is_none()
+        );
+        assert!(linkify_selection("two words", 0..9, "not a url").is_none());
+    }
     #[test]
     fn builds_tables_and_counts_characters() {
         let table = markdown_table(2, 3);
