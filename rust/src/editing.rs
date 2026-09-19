@@ -589,6 +589,249 @@ pub fn linkify_selection(text: &str, range: Range<usize>, url: &str) -> Option<(
     Some((next, cursor))
 }
 
+
+const MARKDOWN_NEST_INDENT: &str = "  ";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkdownContinuation {
+    Bullet(char),
+    Task,
+    Numbered { number: u64, delimiter: char },
+    Quote,
+}
+
+fn leading_whitespace_len(line: &str) -> usize {
+    line.bytes()
+        .take_while(|byte| *byte == b' ' || *byte == b'\t')
+        .count()
+}
+
+fn markdown_continuation(line: &str) -> Option<(usize, usize, MarkdownContinuation)> {
+    let indent_len = leading_whitespace_len(line);
+    let rest = &line[indent_len..];
+
+    for prefix in ["- [ ] ", "- [x] ", "- [X] "] {
+        if rest.starts_with(prefix) {
+            return Some((indent_len, prefix.len(), MarkdownContinuation::Task));
+        }
+    }
+
+    for marker in ['-', '*', '+'] {
+        let prefix = format!("{marker} ");
+        if rest.starts_with(&prefix) {
+            return Some((
+                indent_len,
+                prefix.len(),
+                MarkdownContinuation::Bullet(marker),
+            ));
+        }
+    }
+
+    if rest.starts_with("> ") {
+        return Some((indent_len, 2, MarkdownContinuation::Quote));
+    }
+
+    let bytes = rest.as_bytes();
+    let digits = bytes.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    if digits > 0 {
+        let delimiter = match bytes.get(digits) {
+            Some(b'.') => '.',
+            Some(b')') => ')',
+            _ => return None,
+        };
+        if bytes.get(digits + 1) == Some(&b' ') {
+            let number = rest[..digits].parse::<u64>().ok()?;
+            return Some((
+                indent_len,
+                digits + 2,
+                MarkdownContinuation::Numbered { number, delimiter },
+            ));
+        }
+    }
+
+    None
+}
+
+fn next_markdown_prefix(kind: MarkdownContinuation) -> String {
+    match kind {
+        MarkdownContinuation::Bullet(marker) => format!("{marker} "),
+        MarkdownContinuation::Task => "- [ ] ".to_owned(),
+        MarkdownContinuation::Numbered { number, delimiter } => {
+            format!("{}{delimiter} ", number.saturating_add(1))
+        }
+        MarkdownContinuation::Quote => "> ".to_owned(),
+    }
+}
+
+/// Return a Markdown-aware replacement for Enter.
+///
+/// Ordinary paragraphs intentionally return no replacement so the native input
+/// keeps its normal newline behavior. Lists, tasks, numbered lists, and quotes
+/// are continued. Pressing Enter on an empty structural item removes its marker,
+/// which exits that block without inserting an additional blank line.
+pub fn smart_markdown_enter(text: &str, range: Range<usize>) -> Option<(String, usize)> {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len()).max(start);
+    if start != end || !text.is_char_boundary(start) {
+        return None;
+    }
+
+    let starts = line_starts(text);
+    let line = line_index(&starts, start);
+    let line_start = starts[line];
+    let line_stop = line_end(&starts, line, text.len());
+    let line_text = &text[line_start..line_stop];
+    let local_cursor = start.saturating_sub(line_start).min(line_text.len());
+    let (indent_len, marker_len, kind) = markdown_continuation(line_text)?;
+
+    if local_cursor < indent_len + marker_len {
+        return None;
+    }
+
+    let body = &line_text[indent_len + marker_len..];
+    if body.trim().is_empty() {
+        let mut next = String::with_capacity(text.len().saturating_sub(line_text.len()));
+        next.push_str(&text[..line_start]);
+        next.push_str(&text[line_stop..]);
+        return Some((next, line_start));
+    }
+
+    let indent = &line_text[..indent_len];
+    let prefix = next_markdown_prefix(kind);
+    let insertion = format!("\n{indent}{prefix}");
+    let mut next = String::with_capacity(text.len() + insertion.len());
+    next.push_str(&text[..start]);
+    next.push_str(&insertion);
+    next.push_str(&text[start..]);
+    Some((next, start + insertion.len()))
+}
+
+fn markdown_list_line(line: &str) -> bool {
+    matches!(
+        markdown_continuation(line).map(|(_, _, kind)| kind),
+        Some(
+            MarkdownContinuation::Bullet(_)
+                | MarkdownContinuation::Task
+                | MarkdownContinuation::Numbered { .. }
+        )
+    )
+}
+
+/// Indent or outdent the selected Markdown list lines by one native nesting level.
+///
+/// The preview parser already recognizes two leading spaces as one nested list
+/// level, so this keeps editing behavior aligned with preview semantics.
+pub fn adjust_markdown_list_indent(
+    text: &str,
+    range: Range<usize>,
+    outdent: bool,
+) -> Option<(String, usize)> {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len()).max(start);
+    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return None;
+    }
+
+    let starts = line_starts(text);
+    let (start_line, end_line) = selected_line_span(text, start..end);
+    let mut saw_list = false;
+    let mut changed = false;
+    let mut cursor = end;
+    let mut replacement = String::new();
+
+    for line in start_line..=end_line {
+        if line > start_line {
+            replacement.push('\n');
+        }
+        let line_start = starts[line];
+        let line_stop = line_end(&starts, line, text.len());
+        let line_text = &text[line_start..line_stop];
+
+        if line_text.trim().is_empty() {
+            replacement.push_str(line_text);
+            continue;
+        }
+        if !markdown_list_line(line_text) {
+            return None;
+        }
+        saw_list = true;
+
+        if outdent {
+            let remove = if line_text.starts_with(MARKDOWN_NEST_INDENT) {
+                MARKDOWN_NEST_INDENT.len()
+            } else if line_text.starts_with('\t') {
+                1
+            } else if line_text.starts_with(' ') {
+                1
+            } else {
+                0
+            };
+            if remove > 0 {
+                changed = true;
+                replacement.push_str(&line_text[remove..]);
+                if line_start <= end {
+                    cursor = cursor.saturating_sub(remove);
+                }
+            } else {
+                replacement.push_str(line_text);
+            }
+        } else {
+            changed = true;
+            replacement.push_str(MARKDOWN_NEST_INDENT);
+            replacement.push_str(line_text);
+            if line_start <= end {
+                cursor = cursor.saturating_add(MARKDOWN_NEST_INDENT.len());
+            }
+        }
+    }
+
+    if !saw_list || !changed {
+        return None;
+    }
+
+    let replace_start = starts[start_line];
+    let replace_end = line_end(&starts, end_line, text.len());
+    let mut next = String::with_capacity(
+        text.len() + replacement.len().saturating_sub(replace_end - replace_start),
+    );
+    next.push_str(&text[..replace_start]);
+    next.push_str(&replacement);
+    next.push_str(&text[replace_end..]);
+    let next_cursor = cursor.min(next.len());
+    Some((next, next_cursor))
+}
+
+/// Toggle the task checkbox on the line containing the cursor.
+pub fn toggle_markdown_task(text: &str, cursor: usize) -> Option<(String, usize)> {
+    let cursor = cursor.min(text.len());
+    if !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let starts = line_starts(text);
+    let line = line_index(&starts, cursor);
+    let line_start = starts[line];
+    let line_stop = line_end(&starts, line, text.len());
+    let line_text = &text[line_start..line_stop];
+    let indent_len = leading_whitespace_len(line_text);
+    let rest = &line_text[indent_len..];
+
+    let replacement = if rest.starts_with("- [ ] ") {
+        "- [x] "
+    } else if rest.starts_with("- [x] ") || rest.starts_with("- [X] ") {
+        "- [ ] "
+    } else {
+        return None;
+    };
+
+    let marker_start = line_start + indent_len;
+    let marker_end = marker_start + 6;
+    let mut next = String::with_capacity(text.len());
+    next.push_str(&text[..marker_start]);
+    next.push_str(replacement);
+    next.push_str(&text[marker_end..]);
+    Some((next, cursor))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,6 +880,74 @@ mod tests {
         assert_eq!(line, "- task");
         let (line, _) = toggle_block_prefix("> quote", "- ", 0);
         assert_eq!(line, "- quote");
+    }
+
+    #[test]
+    fn smart_enter_continues_markdown_blocks_and_exits_empty_items() {
+        let (next, cursor) =
+            smart_markdown_enter("- one", 5..5).expect("bullet continuation");
+        assert_eq!(next, "- one\n- ");
+        assert_eq!(cursor, next.len());
+
+        let (next, cursor) =
+            smart_markdown_enter("- [x] done", 10..10).expect("task continuation");
+        assert_eq!(next, "- [x] done\n- [ ] ");
+        assert_eq!(cursor, next.len());
+
+        let (next, cursor) =
+            smart_markdown_enter("9. nine", 7..7).expect("number continuation");
+        assert_eq!(next, "9. nine\n10. ");
+        assert_eq!(cursor, next.len());
+
+        let (next, cursor) =
+            smart_markdown_enter("> quote", 7..7).expect("quote continuation");
+        assert_eq!(next, "> quote\n> ");
+        assert_eq!(cursor, next.len());
+
+        let (next, cursor) =
+            smart_markdown_enter("- one\n- ", 8..8).expect("empty item exits");
+        assert_eq!(next, "- one\n");
+        assert_eq!(cursor, 6);
+    }
+
+    #[test]
+    fn smart_enter_splits_a_list_item_at_the_caret() {
+        let source = "  - hello world";
+        let (next, cursor) =
+            smart_markdown_enter(source, 9..9).expect("nested bullet continuation");
+        assert_eq!(next, "  - hell\n  - o world");
+        assert_eq!(&next[cursor..], "o world");
+    }
+
+    #[test]
+    fn adjusts_only_markdown_list_indentation() {
+        let source = "- one\n- two";
+        let (nested, cursor) =
+            adjust_markdown_list_indent(source, 0..source.len(), false).expect("indent");
+        assert_eq!(nested, "  - one\n  - two");
+        assert_eq!(cursor, nested.len());
+
+        let (flat, cursor) =
+            adjust_markdown_list_indent(&nested, 0..nested.len(), true).expect("outdent");
+        assert_eq!(flat, source);
+        assert_eq!(cursor, source.len());
+
+        assert!(adjust_markdown_list_indent("plain", 0..0, false).is_none());
+        assert!(adjust_markdown_list_indent("- top", 0..0, true).is_none());
+    }
+
+    #[test]
+    fn toggles_task_checkbox_without_moving_the_caret() {
+        let (checked, cursor) =
+            toggle_markdown_task("  - [ ] task", 10).expect("check task");
+        assert_eq!(checked, "  - [x] task");
+        assert_eq!(cursor, 10);
+
+        let (unchecked, cursor) =
+            toggle_markdown_task(&checked, cursor).expect("uncheck task");
+        assert_eq!(unchecked, "  - [ ] task");
+        assert_eq!(cursor, 10);
+        assert!(toggle_markdown_task("- bullet", 4).is_none());
     }
 
     #[test]
