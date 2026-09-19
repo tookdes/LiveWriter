@@ -196,10 +196,7 @@ impl MarkdownInput {
         let state = cx.new(|cx| {
             let mut state = InputState::new(window, cx).default_value(content.clone());
             if multi_line {
-                state = state
-                    .code_editor("markdown")
-                    .line_number(false)
-                    .soft_wrap(true);
+                state = state.multi_line().soft_wrap(true);
             }
             state.masked(masked)
         });
@@ -253,10 +250,7 @@ impl MarkdownInput {
             let state = cx.new(|cx| {
                 let mut state = InputState::new(window, cx).default_value(content.clone());
                 if multi_line {
-                    state = state
-                        .code_editor("markdown")
-                        .line_number(false)
-                        .soft_wrap(true);
+                    state = state.multi_line().soft_wrap(true);
                 }
                 state.masked(masked)
             });
@@ -5271,6 +5265,16 @@ fn main() {
         // editor in the matching light theme instead of inheriting the system dark theme.
         Theme::change(ThemeMode::Light, None, cx);
         cx.bind_keys([
+            KeyBinding::new(
+                "tab",
+                gpui_component::input::Indent,
+                Some("MarkdownEditor"),
+            ),
+            KeyBinding::new(
+                "shift-tab",
+                gpui_component::input::Outdent,
+                Some("MarkdownEditor"),
+            ),
             KeyBinding::new("secondary-n", NewDocument, None),
             KeyBinding::new("secondary-o", OpenDocument, None),
             KeyBinding::new("secondary-shift-o", OpenDraft, None),
