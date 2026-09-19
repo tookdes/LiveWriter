@@ -11,7 +11,7 @@ anyhow = "1"
 encoding_rs = "0.8"
 futures = "0.3"
 gpui = "0.2.2"
-gpui-component = "0.4.0"
+gpui-component = { version = "0.4.0", features = ["tree-sitter-languages"] }
 markdown = "1"
 reqwest = { package = "zed-reqwest", version = "0.12.15-zed", default-features = false, features = ["blocking", "charset", "http2", "rustls-tls-native-roots"] }
 rust-embed = "8.12"
