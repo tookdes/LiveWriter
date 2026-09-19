@@ -5265,11 +5265,7 @@ fn main() {
         // editor in the matching light theme instead of inheriting the system dark theme.
         Theme::change(ThemeMode::Light, None, cx);
         cx.bind_keys([
-            KeyBinding::new(
-                "tab",
-                gpui_component::input::Indent,
-                Some("MarkdownEditor"),
-            ),
+            KeyBinding::new("tab", gpui_component::input::Indent, Some("MarkdownEditor")),
             KeyBinding::new(
                 "shift-tab",
                 gpui_component::input::Outdent,
