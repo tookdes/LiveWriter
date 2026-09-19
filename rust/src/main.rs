@@ -35,10 +35,10 @@ use gpui_component::{
 use rust_embed::Embed;
 
 use crate::editing::{
-    ActiveBlock, InlineFormatState, active_block, character_count, document_outline,
-    inline_format_state, is_clipboard_url, linkify_selection, looks_like_url, markdown_code_block,
-    markdown_link, markdown_table, normalize_url, selection_has_wrap, set_heading_level,
-    toggle_prefixes, wrap_or_unwrap,
+    ActiveBlock, InlineFormatState, active_block, adjust_markdown_list_indent, character_count,
+    document_outline, inline_format_state, is_clipboard_url, linkify_selection, looks_like_url,
+    markdown_code_block, markdown_link, markdown_table, normalize_url, selection_has_wrap,
+    set_heading_level, smart_markdown_enter, toggle_markdown_task, toggle_prefixes, wrap_or_unwrap,
 };
 use crate::markdown::{Block, InlineStyle, parse_blocks, parse_inline};
 use crate::publishing::{
@@ -196,7 +196,10 @@ impl MarkdownInput {
         let state = cx.new(|cx| {
             let mut state = InputState::new(window, cx).default_value(content.clone());
             if multi_line {
-                state = state.multi_line().soft_wrap(true);
+                state = state
+                    .code_editor("markdown")
+                    .line_number(false)
+                    .soft_wrap(true);
             }
             state.masked(masked)
         });
@@ -250,7 +253,10 @@ impl MarkdownInput {
             let state = cx.new(|cx| {
                 let mut state = InputState::new(window, cx).default_value(content.clone());
                 if multi_line {
-                    state = state.multi_line().soft_wrap(true);
+                    state = state
+                        .code_editor("markdown")
+                        .line_number(false)
+                        .soft_wrap(true);
                 }
                 state.masked(masked)
             });
@@ -308,6 +314,41 @@ impl MarkdownInput {
         let range = self.current_range(window, cx);
         let full = self.state.read(cx).text().to_string();
         let Some((next, cursor)) = linkify_selection(&full, range, url) else {
+            return false;
+        };
+        self.apply_document_edit(next, cursor, window, cx);
+        true
+    }
+
+    fn smart_enter(
+        &mut self,
+        secondary: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let range = self.current_range(window, cx);
+        let full = self.state.read(cx).text().to_string();
+        let change = if secondary {
+            toggle_markdown_task(&full, range.end)
+        } else {
+            smart_markdown_enter(&full, range)
+        };
+        let Some((next, cursor)) = change else {
+            return false;
+        };
+        self.apply_document_edit(next, cursor, window, cx);
+        true
+    }
+
+    fn adjust_list_indent(
+        &mut self,
+        outdent: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let range = self.current_range(window, cx);
+        let full = self.state.read(cx).text().to_string();
+        let Some((next, cursor)) = adjust_markdown_list_indent(&full, range, outdent) else {
             return false;
         };
         self.apply_document_edit(next, cursor, window, cx);
@@ -3452,6 +3493,65 @@ impl Render for MarkdownEditor {
             .on_drop(cx.listener(|editor, paths: &ExternalPaths, _, cx| {
                 editor.drop_images(paths, cx);
             }))
+            .capture_action(
+                cx.listener(|editor, action: &gpui_component::input::Enter, window, cx| {
+                    let focused = editor
+                        .text_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window);
+                    if !focused {
+                        return;
+                    }
+                    if editor.text_input.update(cx, |input, cx| {
+                        input.smart_enter(action.secondary, window, cx)
+                    }) {
+                        editor.status = if action.secondary {
+                            "已切换待办状态 · Ctrl/Cmd+Enter".into()
+                        } else {
+                            "Markdown 智能续行".into()
+                        };
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .capture_action(
+                cx.listener(|editor, _: &gpui_component::input::Indent, window, cx| {
+                    let focused = editor
+                        .text_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window);
+                    if focused
+                        && editor.text_input.update(cx, |input, cx| {
+                            input.adjust_list_indent(false, window, cx)
+                        })
+                    {
+                        editor.status = "列表已缩进一级".into();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .capture_action(
+                cx.listener(|editor, _: &gpui_component::input::Outdent, window, cx| {
+                    let focused = editor
+                        .text_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window);
+                    if focused
+                        && editor.text_input.update(cx, |input, cx| {
+                            input.adjust_list_indent(true, window, cx)
+                        })
+                    {
+                        editor.status = "列表已减少一级缩进".into();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
             .capture_action(
                 cx.listener(|editor, _: &gpui_component::input::Paste, window, cx| {
                     let Some(item) = cx.read_from_clipboard() else {
