@@ -456,7 +456,6 @@ pub fn selection_has_wrap(text: &str, range: Range<usize>, prefix: &str, suffix:
             && text[end..].starts_with(suffix))
 }
 
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InlineFormatState {
     pub bold: bool,
@@ -519,7 +518,10 @@ fn marker_active_in_context(
         return true;
     }
 
-    let line_start = text[..start].rfind('\n').map(|index| index + 1).unwrap_or(0);
+    let line_start = text[..start]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
     let line_end = text[end..]
         .find('\n')
         .map(|index| end + index)
@@ -558,11 +560,7 @@ pub fn inline_format_state(text: &str, range: Range<usize>) -> InlineFormatState
     }
 }
 
-pub fn linkify_selection(
-    text: &str,
-    range: Range<usize>,
-    url: &str,
-) -> Option<(String, usize)> {
+pub fn linkify_selection(text: &str, range: Range<usize>, url: &str) -> Option<(String, usize)> {
     let start = range.start.min(text.len());
     let end = range.end.min(text.len()).max(start);
     if start == end
@@ -669,9 +667,7 @@ mod tests {
             linkify_selection("read this now", 5..9, "www.example.com").expect("link");
         assert_eq!(next, "read [this](https://www.example.com) now");
         assert_eq!(cursor, "read [this](https://www.example.com)".len());
-        assert!(
-            linkify_selection("https://old.example", 0..19, "https://new.example").is_none()
-        );
+        assert!(linkify_selection("https://old.example", 0..19, "https://new.example").is_none());
         assert!(linkify_selection("two words", 0..9, "not a url").is_none());
     }
     #[test]
