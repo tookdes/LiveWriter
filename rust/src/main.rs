@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod editing;
+mod highlight;
 mod markdown;
 mod publishing;
 mod storage;
@@ -35,9 +36,10 @@ use gpui_component::{
 use rust_embed::Embed;
 
 use crate::editing::{
-    ActiveBlock, InlineFormatState, active_block, adjust_markdown_list_indent, character_count,
-    document_outline, inline_format_state, is_clipboard_url, linkify_selection, looks_like_url,
-    markdown_code_block, markdown_link, markdown_table, normalize_url, selection_has_wrap,
+    ActiveBlock, InlineFormatState, MarkdownLink, active_block, adjust_markdown_list_indent,
+    character_count, delete_block_span, document_outline, find_markdown_image, format_inline_link,
+    inline_format_state, is_clipboard_url, linkify_selection, looks_like_url, markdown_code_block,
+    markdown_link_at, markdown_table, normalize_url, replace_span, selection_has_wrap,
     set_heading_level, smart_markdown_enter, toggle_markdown_task, toggle_prefixes, wrap_or_unwrap,
 };
 use crate::markdown::{Block, InlineStyle, parse_blocks, parse_inline};
@@ -179,9 +181,18 @@ struct MarkdownInput {
     masked: bool,
     pending_content: Option<SharedString>,
     pending_insert: Option<SharedString>,
+    pending_replace: Option<(std::ops::Range<usize>, SharedString)>,
     refocus_on_recreate: bool,
     pub font_size: f32,
     _subscription: gpui::Subscription,
+}
+
+fn configure_article_input(state: InputState) -> InputState {
+    state
+        .code_editor("markdown")
+        .line_number(false)
+        .indent_guides(false)
+        .soft_wrap(true)
 }
 
 impl MarkdownInput {
@@ -196,7 +207,7 @@ impl MarkdownInput {
         let state = cx.new(|cx| {
             let mut state = InputState::new(window, cx).default_value(content.clone());
             if multi_line {
-                state = state.multi_line().soft_wrap(true);
+                state = configure_article_input(state);
             }
             state.masked(masked)
         });
@@ -208,6 +219,7 @@ impl MarkdownInput {
             masked,
             pending_content: None,
             pending_insert: None,
+            pending_replace: None,
             refocus_on_recreate: false,
             font_size: if multi_line { 16. } else { 14. },
             _subscription: subscription,
@@ -224,6 +236,7 @@ impl MarkdownInput {
         self.content = content.clone();
         self.pending_content = Some(content);
         self.pending_insert = None;
+        self.pending_replace = None;
         cx.notify();
     }
 
@@ -239,6 +252,17 @@ impl MarkdownInput {
         cx.notify();
     }
 
+    fn queue_replace(
+        &mut self,
+        range: std::ops::Range<usize>,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_replace = Some((range, text.into()));
+        self.pending_insert = None;
+        cx.notify();
+    }
+
     fn sync_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(content) = self.pending_content.take() {
             // Recreate the InputState so the native undo/redo history cannot
@@ -250,7 +274,7 @@ impl MarkdownInput {
             let state = cx.new(|cx| {
                 let mut state = InputState::new(window, cx).default_value(content.clone());
                 if multi_line {
-                    state = state.multi_line().soft_wrap(true);
+                    state = configure_article_input(state);
                 }
                 state.masked(masked)
             });
@@ -263,6 +287,11 @@ impl MarkdownInput {
                     window.focus(&handle);
                 });
             }
+        }
+        if let Some((range, text)) = self.pending_replace.take() {
+            let full = self.state.read(cx).text().to_string();
+            let (next, cursor) = replace_span(&full, range, text.as_ref());
+            self.apply_document_edit(next, cursor, window, cx);
         }
         if let Some(text) = self.pending_insert.take() {
             let state = self.state.clone();
@@ -289,7 +318,12 @@ impl MarkdownInput {
         let line = crate::editing::line_index(&starts, cursor);
         let start = starts[line];
         let end = crate::editing::line_end(&starts, line, full.len());
-        EditorVisualContext::from_line(&full[start..end], inline_format_state(&full, range))
+        let mut context = EditorVisualContext::from_line(
+            &full[start..end],
+            inline_format_state(&full, range.clone()),
+        );
+        context.link = markdown_link_at(&full, range).map(|link| link.image);
+        context
     }
 
     fn context_state(
@@ -493,7 +527,6 @@ enum EditorDialog {
     PublishTypecho,
     Drafts,
     Recent,
-    #[allow(dead_code)]
     Lightbox {
         url: String,
         alt: String,
@@ -509,69 +542,26 @@ enum PublishKind {
 #[derive(Clone, Debug)]
 struct EditorVisualContext {
     block: ActiveBlock,
-    marker: SharedString,
-    body: SharedString,
     inline: InlineFormatState,
-    checked: bool,
+    link: Option<bool>,
 }
 
 impl EditorVisualContext {
     fn from_line(line: &str, inline: InlineFormatState) -> Self {
-        let trimmed = line.trim_start();
-        let block = active_block(trimmed);
-        let mut marker = String::new();
-        let mut body = trimmed.to_owned();
-        let mut checked = false;
-
-        match block {
-            ActiveBlock::Heading(level) => {
-                marker = "#".repeat(level as usize);
-                body = trimmed[level as usize..].trim_start().to_owned();
-            }
-            ActiveBlock::Bullet => {
-                let prefix = trimmed.get(..2).unwrap_or("");
-                marker = prefix.trim_end().to_owned();
-                body = trimmed.get(2..).unwrap_or("").to_owned();
-            }
-            ActiveBlock::Task => {
-                checked = trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ");
-                marker = if checked { "☑" } else { "☐" }.to_owned();
-                body = trimmed.get(6..).unwrap_or("").to_owned();
-            }
-            ActiveBlock::Quote => {
-                marker = "❯".to_owned();
-                body = trimmed.strip_prefix("> ").unwrap_or(trimmed).to_owned();
-            }
-            ActiveBlock::Numbered => {
-                let bytes = trimmed.as_bytes();
-                let mut digits = 0usize;
-                while digits < bytes.len() && bytes[digits].is_ascii_digit() {
-                    digits += 1;
-                }
-                let marker_len = if digits < bytes.len() {
-                    digits + 1
-                } else {
-                    digits
-                };
-                marker = trimmed[..marker_len.min(trimmed.len())].to_owned();
-                body = trimmed
-                    .get((digits + 2).min(trimmed.len())..)
-                    .unwrap_or("")
-                    .to_owned();
-            }
-            ActiveBlock::Paragraph => {}
-        }
-
         Self {
-            block,
-            marker: marker.into(),
-            body: body.into(),
+            block: active_block(line.trim_start()),
             inline,
-            checked,
+            link: None,
         }
     }
 
     fn label(&self) -> &'static str {
+        if self.link == Some(true) {
+            return "\u{56fe}\u{7247}";
+        }
+        if self.link == Some(false) {
+            return "\u{94fe}\u{63a5}";
+        }
         match self.block {
             ActiveBlock::Heading(1) => "H1 标题",
             ActiveBlock::Heading(2) => "H2 标题",
@@ -613,6 +603,7 @@ struct MarkdownEditor {
     splitter_dragging: bool,
     settings_visible: bool,
     dialog: EditorDialog,
+    link_edit: Option<MarkdownLink>,
     dirty: bool,
     status: SharedString,
     publish_settings: StoredPublishSettings,
@@ -735,6 +726,7 @@ impl MarkdownEditor {
             splitter_dragging: false,
             settings_visible: false,
             dialog: EditorDialog::None,
+            link_edit: None,
             dirty: false,
             status: "就绪 · Markdown 模式".into(),
             last_observed_content: initial.clone(),
@@ -859,6 +851,7 @@ impl MarkdownEditor {
 
     fn close_dialog(&mut self, cx: &mut Context<Self>) {
         self.dialog = EditorDialog::None;
+        self.link_edit = None;
         cx.notify();
     }
 
@@ -1840,8 +1833,35 @@ impl MarkdownEditor {
         self.apply_prefix("> ", "已切换引用", window, cx);
     }
 
-    fn link_action(&mut self, _: &LinkText, window: &mut Window, cx: &mut Context<Self>) {
+    fn current_markdown_link(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<MarkdownLink> {
+        self.text_input.update(cx, |input, cx| {
+            let range = input.current_range(window, cx);
+            let full = input.state.read(cx).text().to_string();
+            markdown_link_at(&full, range)
+        })
+    }
+
+    fn open_link_dialog(
+        &mut self,
+        link: Option<MarkdownLink>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.settings_visible = false;
+        if let Some(link) = link {
+            self.link_text_input
+                .update(cx, |input, cx| input.set_content(link.label.clone(), cx));
+            self.link_url_input
+                .update(cx, |input, cx| input.set_content(link.url.clone(), cx));
+            self.link_edit = Some(link);
+            self.dialog = EditorDialog::Link;
+            cx.notify();
+            return;
+        }
         let selected = self.text_input.update(cx, |input, cx| {
             let range = input.current_range(window, cx);
             let full = input.state.read(cx).text().to_string();
@@ -1867,6 +1887,7 @@ impl MarkdownEditor {
         } else {
             selected
         };
+        self.link_edit = None;
         self.link_text_input
             .update(cx, |input, cx| input.set_content(label, cx));
         self.link_url_input
@@ -1875,15 +1896,33 @@ impl MarkdownEditor {
         cx.notify();
     }
 
+    fn link_action(&mut self, _: &LinkText, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.current_markdown_link(window, cx);
+        self.open_link_dialog(current, window, cx);
+    }
+
     fn confirm_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let label = self.link_text_input.read(cx).content.to_string();
         let url = self.link_url_input.read(cx).content.to_string();
-        let snippet = markdown_link(&label, &url);
+        let editing = self.link_edit.take();
+        let image = editing.as_ref().is_some_and(|link| link.image);
+        let snippet = format_inline_link(image, &label, &url);
         self.dialog = EditorDialog::None;
-        self.text_input.update(cx, |input, cx| {
-            input.queue_insert(snippet, cx);
-        });
-        self.status = "\u{5df2}\u{63d2}\u{5165}\u{94fe}\u{63a5}".into();
+        if let Some(link) = editing {
+            self.text_input.update(cx, |input, cx| {
+                input.queue_replace(link.range, snippet, cx);
+            });
+            self.status = if image {
+                "\u{5df2}\u{66f4}\u{65b0}\u{56fe}\u{7247}".into()
+            } else {
+                "\u{5df2}\u{66f4}\u{65b0}\u{94fe}\u{63a5}".into()
+            };
+        } else {
+            self.text_input.update(cx, |input, cx| {
+                input.queue_insert(snippet, cx);
+            });
+            self.status = "\u{5df2}\u{63d2}\u{5165}\u{94fe}\u{63a5}".into();
+        }
         let _ = window;
         cx.notify();
     }
@@ -1961,6 +2000,16 @@ impl MarkdownEditor {
     }
 
     fn insert_image_bytes(&mut self, file_name: &str, bytes: &[u8], cx: &mut Context<Self>) {
+        self.write_image_bytes(file_name, bytes, None, cx);
+    }
+
+    fn write_image_bytes(
+        &mut self,
+        file_name: &str,
+        bytes: &[u8],
+        replace: Option<MarkdownLink>,
+        cx: &mut Context<Self>,
+    ) {
         let dest_dir = if let Some(path) = self.path.as_ref() {
             storage::media_dir_for_document(path)
         } else {
@@ -1979,8 +2028,18 @@ impl MarkdownEditor {
                     self.pending_media.push(saved.clone());
                 }
                 let url = storage::relative_media_url(self.path.as_deref(), &saved);
-                let snippet = format!("![\u{56fe}\u{7247}]({url})");
-                self.insert_snippet(snippet, "\u{5df2}\u{63d2}\u{5165}\u{56fe}\u{7247}", cx);
+                if let Some(target) = replace {
+                    let snippet = format_inline_link(true, &target.label, &url);
+                    self.text_input.update(cx, |input, cx| {
+                        input.queue_replace(target.range, snippet, cx);
+                    });
+                    self.dialog = EditorDialog::None;
+                    self.status = "\u{5df2}\u{66f4}\u{6362}\u{56fe}\u{7247}".into();
+                    cx.notify();
+                } else {
+                    let snippet = format!("![\u{56fe}\u{7247}]({url})");
+                    self.insert_snippet(snippet, "\u{5df2}\u{63d2}\u{5165}\u{56fe}\u{7247}", cx);
+                }
             }
             Err(error) => {
                 self.status =
@@ -1991,11 +2050,39 @@ impl MarkdownEditor {
         }
     }
 
-    fn image_action(&mut self, _: &ImageText, _window: &mut Window, cx: &mut Context<Self>) {
+    fn replace_local_image(
+        &mut self,
+        target: MarkdownLink,
+        source: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if !is_image_path(&source) {
+            self.status = "\u{8bf7}\u{9009}\u{62e9} PNG\u{3001}JPEG\u{3001}GIF\u{3001}WebP\u{3001}SVG \u{6216} BMP \u{56fe}\u{7247}".into();
+            cx.notify();
+            return;
+        }
+        let bytes = match fs::read(&source) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status =
+                    format!("\u{8bfb}\u{53d6}\u{56fe}\u{7247}\u{5931}\u{8d25}\u{ff1a}{error}")
+                        .into();
+                cx.notify();
+                return;
+            }
+        };
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image.png");
+        self.write_image_bytes(name, &bytes, Some(target), cx);
+    }
+
+    fn pick_images(&mut self, replace: Option<MarkdownLink>, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
-            multiple: true,
+            multiple: replace.is_none(),
             prompt: Some("\u{9009}\u{62e9}\u{56fe}\u{7247}\u{6587}\u{4ef6}".into()),
         });
         cx.spawn(async move |editor, cx| {
@@ -2003,12 +2090,118 @@ impl MarkdownEditor {
                 return;
             };
             let _ = editor.update(cx, |editor, cx| {
-                for path in paths {
-                    editor.insert_local_image(path, cx);
+                if let Some(target) = replace {
+                    if let Some(path) = paths.into_iter().next() {
+                        editor.replace_local_image(target, path, cx);
+                    }
+                } else {
+                    for path in paths {
+                        editor.insert_local_image(path, cx);
+                    }
                 }
             });
         })
         .detach();
+    }
+
+    fn image_action(&mut self, _: &ImageText, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(link) = self.current_markdown_link(window, cx)
+            && link.image
+        {
+            self.open_image_lightbox(link.url, link.label, cx);
+            return;
+        }
+        self.pick_images(None, cx);
+    }
+
+    fn open_image_lightbox(&mut self, url: String, alt: String, cx: &mut Context<Self>) {
+        self.settings_visible = false;
+        self.dialog = EditorDialog::Lightbox { url, alt };
+        cx.notify();
+    }
+
+    fn lightbox_target(&self, cx: &App) -> Option<MarkdownLink> {
+        let EditorDialog::Lightbox { url, alt } = &self.dialog else {
+            return None;
+        };
+        let full = self.text_input.read(cx).content.to_string();
+        find_markdown_image(&full, url, alt)
+    }
+
+    fn edit_lightbox_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(link) = self.lightbox_target(cx) else {
+            self.status = "\u{672a}\u{627e}\u{5230}\u{5bf9}\u{5e94}\u{56fe}\u{7247}".into();
+            cx.notify();
+            return;
+        };
+        self.open_link_dialog(Some(link), window, cx);
+    }
+
+    fn replace_lightbox_image(&mut self, cx: &mut Context<Self>) {
+        let Some(link) = self.lightbox_target(cx) else {
+            self.status = "\u{672a}\u{627e}\u{5230}\u{5bf9}\u{5e94}\u{56fe}\u{7247}".into();
+            cx.notify();
+            return;
+        };
+        self.pick_images(Some(link), cx);
+    }
+
+    fn copy_lightbox_url(&mut self, cx: &mut Context<Self>) {
+        let EditorDialog::Lightbox { url, .. } = &self.dialog else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+        self.status = "\u{5df2}\u{590d}\u{5236}\u{56fe}\u{7247}\u{5730}\u{5740}".into();
+        cx.notify();
+    }
+
+    fn open_lightbox_source(&mut self, cx: &mut Context<Self>) {
+        let EditorDialog::Lightbox { url, .. } = &self.dialog else {
+            return;
+        };
+        if looks_like_url(url) {
+            cx.open_url(url);
+            return;
+        }
+        if let Some(path) = self.resolve_article_path(url)
+            && path.exists()
+        {
+            let href = format!("file:///{}", path.to_string_lossy().replace('\\', "/"));
+            cx.open_url(&href);
+        } else {
+            self.status = "\u{65e0}\u{6cd5}\u{6253}\u{5f00}\u{56fe}\u{7247}".into();
+            cx.notify();
+        }
+    }
+
+    fn delete_lightbox_image(&mut self, cx: &mut Context<Self>) {
+        let Some(link) = self.lightbox_target(cx) else {
+            self.status = "\u{672a}\u{627e}\u{5230}\u{5bf9}\u{5e94}\u{56fe}\u{7247}".into();
+            cx.notify();
+            return;
+        };
+        let full = self.text_input.read(cx).content.to_string();
+        let (next, _) = delete_block_span(&full, link.range);
+        let len = full.len();
+        self.text_input.update(cx, |input, cx| {
+            input.queue_replace(0..len, next, cx);
+        });
+        self.dialog = EditorDialog::None;
+        self.status = "\u{5df2}\u{5220}\u{9664}\u{56fe}\u{7247}".into();
+        cx.notify();
+    }
+
+    fn resolve_article_path(&self, url: &str) -> Option<PathBuf> {
+        let decoded = percent_decode(url);
+        if let Some(path) = decoded.strip_prefix("file:///") {
+            Some(PathBuf::from(path))
+        } else if looks_like_url(&decoded) {
+            None
+        } else if let Some(base) = self.path.as_ref().and_then(|path| path.parent()) {
+            Some(base.join(decoded.replace('/', std::path::MAIN_SEPARATOR_STR)))
+        } else {
+            Some(PathBuf::from(decoded))
+        }
     }
 
     fn paste_image(&mut self, _: &PasteImage, window: &mut Window, cx: &mut Context<Self>) {
@@ -2071,6 +2264,7 @@ impl MarkdownEditor {
         let clip = String::new();
         self.link_url_input
             .update(cx, |input, cx| input.set_content(clip, cx));
+        self.link_edit = None;
         self.dialog = EditorDialog::Link;
         self.status = "\u{63d2}\u{5165}\u{89c6}\u{9891}\u{94fe}\u{63a5}".into();
         cx.notify();
@@ -2235,6 +2429,13 @@ impl MarkdownEditor {
         let (active_block, inline_state) = self
             .text_input
             .update(cx, |input, cx| input.context_state(window, cx));
+        let current_link = self.text_input.update(cx, |input, cx| {
+            let range = input.current_range(window, cx);
+            let full = input.state.read(cx).text().to_string();
+            markdown_link_at(&full, range)
+        });
+        let on_link = current_link.as_ref().is_some_and(|link| !link.image);
+        let on_image = current_link.as_ref().is_some_and(|link| link.image);
         match self.active_tab {
             0 => div()
                 .h(RIBBON_HEIGHT)
@@ -2401,16 +2602,18 @@ impl MarkdownEditor {
                     "插入",
                     ribbon_controls!(
                         ribbon_stack!(
-                            ribbon_small_button(
+                            ribbon_small_toggle(
                                 "icons/link.png",
                                 "超链接",
+                                on_link,
                                 cx.listener(|editor, _event, window, cx| {
                                     editor.link_action(&LinkText, window, cx)
                                 }),
                             ),
-                            ribbon_small_button(
+                            ribbon_small_toggle(
                                 "icons/image.png",
                                 "图片",
+                                on_image,
                                 cx.listener(|editor, _event, window, cx| {
                                     editor.image_action(&ImageText, window, cx)
                                 }),
@@ -2540,17 +2743,19 @@ impl MarkdownEditor {
                 .child(ribbon_group(
                     "媒体",
                     ribbon_controls!(
-                        ribbon_large_button(
+                        ribbon_large_toggle(
                             "icons/image-large.png",
                             "图片",
+                            on_image,
                             cx.listener(|editor, _event, window, cx| {
                                 editor.image_action(&ImageText, window, cx)
                             }),
                         ),
                         ribbon_stack!(
-                            ribbon_small_button(
+                            ribbon_small_toggle(
                                 "icons/link.png",
                                 "超链接",
+                                on_link,
                                 cx.listener(|editor, _event, window, cx| {
                                     editor.link_action(&LinkText, window, cx)
                                 }),
@@ -2918,7 +3123,7 @@ impl MarkdownEditor {
             EditorDialog::PublishTypecho => self.publish_dialog(PublishKind::Typecho, cx),
             EditorDialog::Drafts => self.drafts_dialog(cx),
             EditorDialog::Recent => self.recent_dialog(cx),
-            EditorDialog::Lightbox { url, alt } => self.lightbox_dialog(url, alt),
+            EditorDialog::Lightbox { url, alt } => self.lightbox_dialog(url, alt, cx),
         };
         div()
             .absolute()
@@ -2984,8 +3189,13 @@ impl MarkdownEditor {
     }
 
     fn link_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (title, confirm) = match self.link_edit.as_ref() {
+            Some(link) if link.image => ("\u{7f16}\u{8f91}\u{56fe}\u{7247}", "\u{66f4}\u{65b0}"),
+            Some(_) => ("\u{7f16}\u{8f91}\u{94fe}\u{63a5}", "\u{66f4}\u{65b0}"),
+            None => ("\u{63d2}\u{5165}\u{94fe}\u{63a5}", "\u{63d2}\u{5165}"),
+        };
         Self::dialog_card(
-            "\u{63d2}\u{5165}\u{94fe}\u{63a5}",
+            title,
             div()
                 .flex()
                 .flex_col()
@@ -3013,7 +3223,7 @@ impl MarkdownEditor {
                         ))
                         .child(Self::dialog_button(
                             "confirm-link",
-                            "\u{63d2}\u{5165}",
+                            confirm,
                             true,
                             cx.listener(|editor, _, window, cx| editor.confirm_link(window, cx)),
                         )),
@@ -3337,7 +3547,7 @@ impl MarkdownEditor {
         .into_any_element()
     }
 
-    fn lightbox_dialog(&self, url: &str, alt: &str) -> AnyElement {
+    fn lightbox_dialog(&self, url: &str, alt: &str, cx: &mut Context<Self>) -> AnyElement {
         let source = preview_image_source(url, self.path.as_ref().and_then(|path| path.parent()));
         Self::dialog_card(
             "\u{56fe}\u{7247}",
@@ -3347,7 +3557,52 @@ impl MarkdownEditor {
                 .gap_2()
                 .child(img(source).max_w(px(520.)).max_h(px(420.)))
                 .child(div().text_xs().text_color(rgb(MUTED)).child(alt.to_owned()))
-                .child(div().text_xs().text_color(rgb(BLUE)).child(url.to_owned())),
+                .child(div().text_xs().text_color(rgb(BLUE)).child(url.to_owned()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .justify_end()
+                        .gap_2()
+                        .child(Self::dialog_button(
+                            "lightbox-edit",
+                            "\u{7f16}\u{8f91}",
+                            false,
+                            cx.listener(|editor, _, window, cx| {
+                                editor.edit_lightbox_image(window, cx)
+                            }),
+                        ))
+                        .child(Self::dialog_button(
+                            "lightbox-replace",
+                            "\u{66f4}\u{6362}",
+                            false,
+                            cx.listener(|editor, _, _, cx| editor.replace_lightbox_image(cx)),
+                        ))
+                        .child(Self::dialog_button(
+                            "lightbox-copy",
+                            "\u{590d}\u{5236}\u{5730}\u{5740}",
+                            false,
+                            cx.listener(|editor, _, _, cx| editor.copy_lightbox_url(cx)),
+                        ))
+                        .child(Self::dialog_button(
+                            "lightbox-open",
+                            "\u{6253}\u{5f00}",
+                            false,
+                            cx.listener(|editor, _, _, cx| editor.open_lightbox_source(cx)),
+                        ))
+                        .child(Self::dialog_button(
+                            "lightbox-delete",
+                            "\u{5220}\u{9664}",
+                            false,
+                            cx.listener(|editor, _, _, cx| editor.delete_lightbox_image(cx)),
+                        ))
+                        .child(Self::dialog_button(
+                            "lightbox-close",
+                            "\u{5173}\u{95ed}",
+                            true,
+                            cx.listener(|editor, _, _, cx| editor.close_dialog(cx)),
+                        )),
+                ),
         )
         .into_any_element()
     }
@@ -3465,6 +3720,7 @@ impl Render for MarkdownEditor {
                         "Markdown \u{9884}\u{89c8}",
                         preview_scroll,
                         base,
+                        cx,
                     ));
                 }
                 WorkspaceMode::Split => {
@@ -3505,6 +3761,7 @@ impl Render for MarkdownEditor {
                             "Markdown \u{9884}\u{89c8}",
                             preview_scroll,
                             base,
+                            cx,
                         ));
                 }
             }
@@ -3614,15 +3871,17 @@ impl Render for MarkdownEditor {
                         .read(cx)
                         .focus_handle(cx)
                         .is_focused(window);
-                    if focused
-                        && editor
-                            .text_input
-                            .update(cx, |input, cx| input.adjust_list_indent(false, window, cx))
+                    if !focused {
+                        return;
+                    }
+                    if editor
+                        .text_input
+                        .update(cx, |input, cx| input.adjust_list_indent(false, window, cx))
                     {
                         editor.status = "列表已缩进一级".into();
-                        cx.stop_propagation();
-                        cx.notify();
                     }
+                    cx.stop_propagation();
+                    cx.notify();
                 }),
             )
             .capture_action(cx.listener(
@@ -3632,15 +3891,57 @@ impl Render for MarkdownEditor {
                         .read(cx)
                         .focus_handle(cx)
                         .is_focused(window);
-                    if focused
-                        && editor
-                            .text_input
-                            .update(cx, |input, cx| input.adjust_list_indent(true, window, cx))
+                    if !focused {
+                        return;
+                    }
+                    if editor
+                        .text_input
+                        .update(cx, |input, cx| input.adjust_list_indent(true, window, cx))
                     {
                         editor.status = "列表已减少一级缩进".into();
-                        cx.stop_propagation();
-                        cx.notify();
                     }
+                    cx.stop_propagation();
+                    cx.notify();
+                },
+            ))
+            .capture_action(cx.listener(
+                |editor, _: &gpui_component::input::IndentInline, window, cx| {
+                    let focused = editor
+                        .text_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window);
+                    if !focused {
+                        return;
+                    }
+                    if editor
+                        .text_input
+                        .update(cx, |input, cx| input.adjust_list_indent(false, window, cx))
+                    {
+                        editor.status = "列表已缩进一级".into();
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                },
+            ))
+            .capture_action(cx.listener(
+                |editor, _: &gpui_component::input::OutdentInline, window, cx| {
+                    let focused = editor
+                        .text_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window);
+                    if !focused {
+                        return;
+                    }
+                    if editor
+                        .text_input
+                        .update(cx, |input, cx| input.adjust_list_indent(true, window, cx))
+                    {
+                        editor.status = "列表已减少一级缩进".into();
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
                 },
             ))
             .capture_action(
@@ -4042,7 +4343,6 @@ fn editor_panel(
     scroll: ScrollHandle,
     context: EditorVisualContext,
 ) -> impl IntoElement {
-    let show_lens = !context.body.as_ref().trim().is_empty();
     let mut panel = div()
         .flex()
         .flex_col()
@@ -4081,9 +4381,6 @@ fn editor_panel(
                         .child(context.label()),
                 ),
         )
-        .when(show_lens, |this| {
-            this.child(editor_prose_lens(context.clone()))
-        })
         .child(
             div()
                 .id("markdown-editor-scroll")
@@ -4099,125 +4396,12 @@ fn editor_panel(
         )
 }
 
-fn editor_inline_badges(state: InlineFormatState) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .gap_1()
-        .when(state.bold, |this| {
-            this.child(
-                div()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(rgb(0xe7f0f9))
-                    .font_weight(FontWeight(700.))
-                    .child("B"),
-            )
-        })
-        .when(state.italic, |this| {
-            this.child(div().px_1().rounded_sm().bg(rgb(0xe7f0f9)).child("I"))
-        })
-        .when(state.strike, |this| {
-            this.child(div().px_1().rounded_sm().bg(rgb(0xe7f0f9)).child("S"))
-        })
-        .when(state.code, |this| {
-            this.child(div().px_1().rounded_sm().bg(rgb(0xe7f0f9)).child("</>"))
-        })
-}
-
-fn editor_prose_lens(context: EditorVisualContext) -> AnyElement {
-    let body = context.body.clone();
-    let inline = context.inline;
-    let content = match context.block {
-        ActiveBlock::Heading(level) => {
-            let size = match level {
-                1 => px(20.),
-                2 => px(18.),
-                3 => px(17.),
-                _ => px(16.),
-            };
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_size(size)
-                .font_weight(FontWeight(700.))
-                .text_color(rgb(0x203c59))
-                .child(body)
-                .into_any_element()
-        }
-        ActiveBlock::Quote => div()
-            .flex()
-            .items_center()
-            .border_l_3()
-            .border_color(rgb(BLUE))
-            .pl_3()
-            .text_color(rgb(0x50677d))
-            .child(body)
-            .into_any_element(),
-        ActiveBlock::Bullet | ActiveBlock::Numbered => div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .font_weight(FontWeight(700.))
-                    .text_color(rgb(BLUE))
-                    .child(context.marker.clone()),
-            )
-            .child(body)
-            .into_any_element(),
-        ActiveBlock::Task => div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .font_weight(FontWeight(700.))
-                    .text_color(rgb(if context.checked { 0x64815f } else { BLUE }))
-                    .child(context.marker.clone()),
-            )
-            .child(
-                div()
-                    .when(context.checked, |this| {
-                        this.text_color(rgb(MUTED)).line_through()
-                    })
-                    .child(body),
-            )
-            .into_any_element(),
-        ActiveBlock::Paragraph => div().flex().items_center().child(body).into_any_element(),
-    };
-
-    div()
-        .min_h(px(42.))
-        .w_full()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .px_4()
-        .py_2()
-        .bg(rgb(0xfafcfe))
-        .border_b_1()
-        .border_color(rgb(0xe4eaf0))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .min_w_0()
-                .child(div().text_xs().text_color(rgb(0x8796a5)).child("排版"))
-                .child(content),
-        )
-        .child(editor_inline_badges(inline))
-        .into_any_element()
-}
-
 fn preview_panel(
     content: SharedString,
     label: &'static str,
     scroll: ScrollHandle,
     base: Option<PathBuf>,
+    cx: &mut Context<MarkdownEditor>,
 ) -> impl IntoElement {
     div()
         .flex()
@@ -4254,7 +4438,7 @@ fn preview_panel(
                 .track_scroll(&scroll)
                 .whitespace_normal()
                 .p_5()
-                .children(markdown_preview(content.as_ref(), base.as_deref())),
+                .children(markdown_preview(content.as_ref(), base.as_deref(), cx)),
         )
 }
 
@@ -4787,7 +4971,11 @@ fn ribbon_icon(path: &'static str) -> Img {
     img(image)
 }
 
-fn markdown_preview(markdown: &str, base: Option<&Path>) -> Vec<gpui::AnyElement> {
+fn markdown_preview(
+    markdown: &str,
+    base: Option<&Path>,
+    cx: &mut Context<MarkdownEditor>,
+) -> Vec<gpui::AnyElement> {
     let blocks = parse_blocks(markdown);
     if blocks.is_empty() {
         return vec![
@@ -4818,7 +5006,7 @@ fn markdown_preview(markdown: &str, base: Option<&Path>) -> Vec<gpui::AnyElement
                     .font_weight(FontWeight(700.))
                     .text_size(size)
                     .text_color(rgb(0x203c59))
-                    .child(inline_preview(&text, base))
+                    .child(inline_preview(&text, base, cx))
                     .into_any_element()
             }
             Block::Paragraph(text) => div()
@@ -4827,7 +5015,7 @@ fn markdown_preview(markdown: &str, base: Option<&Path>) -> Vec<gpui::AnyElement
                 .mb_3()
                 .text_base()
                 .line_height(px(26.))
-                .child(inline_preview(&text, base))
+                .child(inline_preview(&text, base, cx))
                 .into_any_element(),
             Block::Bullet { text, depth } => div()
                 .id(("preview-bullet", index))
@@ -4837,7 +5025,7 @@ fn markdown_preview(markdown: &str, base: Option<&Path>) -> Vec<gpui::AnyElement
                 .flex()
                 .text_base()
                 .child("• ")
-                .child(inline_preview(&text, base))
+                .child(inline_preview(&text, base, cx))
                 .into_any_element(),
             Block::Numbered {
                 marker,
@@ -4851,7 +5039,7 @@ fn markdown_preview(markdown: &str, base: Option<&Path>) -> Vec<gpui::AnyElement
                 .flex()
                 .text_base()
                 .child(format!("{}. ", marker))
-                .child(inline_preview(&text, base))
+                .child(inline_preview(&text, base, cx))
                 .into_any_element(),
             Block::Task {
                 checked,
@@ -4885,7 +5073,7 @@ fn markdown_preview(markdown: &str, base: Option<&Path>) -> Vec<gpui::AnyElement
                     .child(
                         div()
                             .when(checked, |this| this.text_color(rgb(MUTED)).line_through())
-                            .child(inline_preview(&text, base)),
+                            .child(inline_preview(&text, base, cx)),
                     )
                     .into_any_element()
             }
@@ -4898,7 +5086,7 @@ fn markdown_preview(markdown: &str, base: Option<&Path>) -> Vec<gpui::AnyElement
                 .border_color(rgb(BLUE))
                 .italic()
                 .text_color(rgb(MUTED))
-                .child(inline_preview(&text, base))
+                .child(inline_preview(&text, base, cx))
                 .into_any_element(),
             Block::Aside(text) => {
                 let content = if text.trim().is_empty() {
@@ -4923,7 +5111,7 @@ fn markdown_preview(markdown: &str, base: Option<&Path>) -> Vec<gpui::AnyElement
                             .flex_grow()
                             .min_w_0()
                             .line_height(px(24.))
-                            .child(inline_preview(&content, base)),
+                            .child(inline_preview(&content, base, cx)),
                     )
                     .into_any_element()
             }
@@ -4976,16 +5164,24 @@ fn markdown_preview(markdown: &str, base: Option<&Path>) -> Vec<gpui::AnyElement
                     )
                     .into_any_element()
             }
-            Block::Image { alt, url } => div()
-                .id(("preview-image", index))
-                .w_full()
-                .mb_3()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(img(preview_image_source(&url, base)).max_w_full())
-                .child(div().text_xs().text_color(rgb(MUTED)).child(alt))
-                .into_any_element(),
+            Block::Image { alt, url } => {
+                let click_url = url.clone();
+                let click_alt = alt.clone();
+                div()
+                    .id(("preview-image", index))
+                    .w_full()
+                    .mb_3()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |editor, _, _, cx| {
+                        editor.open_image_lightbox(click_url.clone(), click_alt.clone(), cx);
+                    }))
+                    .child(img(preview_image_source(&url, base)).max_w_full())
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(alt))
+                    .into_any_element()
+            }
             Block::Video { url } => div()
                 .id(("preview-video", index))
                 .w_full()
@@ -5005,13 +5201,14 @@ fn markdown_preview(markdown: &str, base: Option<&Path>) -> Vec<gpui::AnyElement
                     .flex_col()
                     .border_1()
                     .border_color(rgb(BORDER));
-                table = table.child(preview_table_row(headers, true, index * 1000, base));
+                table = table.child(preview_table_row(headers, true, index * 1000, base, cx));
                 for (row_index, row) in rows.into_iter().enumerate() {
                     table = table.child(preview_table_row(
                         row,
                         false,
                         index * 1000 + row_index + 1,
                         base,
+                        cx,
                     ));
                 }
                 div()
@@ -5051,6 +5248,7 @@ fn preview_table_row(
     header: bool,
     index: usize,
     base: Option<&Path>,
+    cx: &mut Context<MarkdownEditor>,
 ) -> gpui::AnyElement {
     let mut row = div().id(("preview-table-row", index)).flex().w_full();
     for (cell_index, cell) in cells.into_iter().enumerate() {
@@ -5062,7 +5260,7 @@ fn preview_table_row(
             .border_color(rgb(BORDER))
             .border_r_1()
             .border_b_1()
-            .child(inline_preview(&cell, base));
+            .child(inline_preview(&cell, base, cx));
         if header {
             element = element.font_weight(FontWeight(600.)).bg(rgb(0xf1f6fb));
         }
@@ -5071,7 +5269,11 @@ fn preview_table_row(
     row.into_any_element()
 }
 
-fn inline_preview(markdown: &str, base: Option<&Path>) -> gpui::AnyElement {
+fn inline_preview(
+    markdown: &str,
+    base: Option<&Path>,
+    cx: &mut Context<MarkdownEditor>,
+) -> gpui::AnyElement {
     let pieces = parse_inline(markdown);
 
     // Render styled runs as one block-level wrapped text element per segment.
@@ -5091,19 +5293,18 @@ fn inline_preview(markdown: &str, base: Option<&Path>) -> gpui::AnyElement {
                 std::mem::take(&mut highlights),
             );
             let click_url = url.clone();
+            let click_alt = piece.text.clone();
             column = column.child(
                 div()
                     .w_full()
                     .max_w_full()
                     .min_w_0()
                     .my_1()
-                    .id("preview-inline-image")
+                    .id(SharedString::from(format!("preview-inline-image-{url}")))
                     .cursor_pointer()
-                    .on_click(move |_, _, cx| {
-                        if looks_like_url(&click_url) {
-                            cx.open_url(&click_url);
-                        }
-                    })
+                    .on_click(cx.listener(move |editor, _, _, cx| {
+                        editor.open_image_lightbox(click_url.clone(), click_alt.clone(), cx);
+                    }))
                     .child(
                         img(preview_image_source(&url, base))
                             .max_h(px(160.))
@@ -5252,6 +5453,8 @@ fn main() {
         // The application uses a fixed light Windows Live Writer palette. Keep the component
         // editor in the matching light theme instead of inheriting the system dark theme.
         Theme::change(ThemeMode::Light, None, cx);
+        crate::highlight::register_markdown_highlighter();
+        crate::highlight::apply_article_syntax_theme(cx);
         cx.bind_keys([
             KeyBinding::new("tab", gpui_component::input::Indent, Some("MarkdownEditor")),
             KeyBinding::new(
